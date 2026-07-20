@@ -693,13 +693,36 @@
       var res = s.res || 64;
       if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
 
-      // "show in 2D": trace the surface against the unused variable's zero plane
+      // "show in 2D": slice the row's own rendered mesh with the free
+      // variable's zero plane, so domain-edge refinement (asymptotes)
+      // carries over into the flat curve
       if (s.flat2d) {
         var fv = this.flat2dInfo(row);
-        var F2 = fv ? this.implicitFnFor(row) : null;
-        if (F2) {
-          var plane = G.gridPlane(fv, win, this._fastMode ? 32 : 96);
-          return G.intersectionCurve(F2, plane, win, style);
+        if (fv) {
+          s.flat2d = false;
+          var obj3d = null;
+          try { obj3d = this.buildObject(row, spec); } finally { s.flat2d = true; }
+          var meshGeo = null;
+          if (obj3d) {
+            obj3d.traverse(function (o) {
+              if (!meshGeo && o.isMesh && o.geometry.getAttribute('position')) meshGeo = o.geometry;
+            });
+          }
+          if (meshGeo) {
+            var lim = { x: [win.xmin, win.xmax], y: [win.ymin, win.ymax], z: [win.zmin, win.zmax] }[fv];
+            var c0 = Math.max(lim[0], Math.min(lim[1], 0));
+            var ci = { x: 0, y: 1, z: 2 }[fv];
+            var Fc = function (x, y, z) { return [x, y, z][ci] - c0; };
+            var curve = G.intersectionCurve(Fc, meshGeo, win, style);
+            obj3d.traverse(function (o) {
+              if (o.geometry) o.geometry.dispose();
+              if (o.material) {
+                if (o.material.map) o.material.map.dispose();
+                o.material.dispose();
+              }
+            });
+            return curve;
+          }
         }
       }
       var assertFinite = function (p, what) {
@@ -993,7 +1016,6 @@
         }
       };
       var closeDocs = function () { drawer.classList.add('hiddenb'); };
-      document.getElementById('docsbtn').addEventListener('click', openDocs);
       document.getElementById('helpbtn').addEventListener('click', openDocs);
       document.getElementById('docsclose').addEventListener('click', closeDocs);
       document.addEventListener('keydown', function (ev) {
@@ -1004,7 +1026,7 @@
         if (!ev.target.closest('.popover') && !ev.target.closest('#gsettings')) {
           document.querySelectorAll('.popover').forEach(function (p) { p.classList.add('hiddenb'); });
         }
-        if (!ev.target.closest('#docsdrawer') && !ev.target.closest('#docsbtn') && !ev.target.closest('#helpbtn')) closeDocs();
+        if (!ev.target.closest('#docsdrawer') && !ev.target.closest('#helpbtn')) closeDocs();
         if (!ev.target.closest('.rowsettings') && !ev.target.closest('.gear')) self.closeAllSettings();
         if (!ev.target.closest('.styleflyout') && !ev.target.closest('.swatch')) self.closeAllFlyouts();
       });

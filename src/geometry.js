@@ -70,6 +70,47 @@
         valid[k] = 1;
       }
     }
+    // Domain-edge refinement: an unusable vertex next to a usable one is
+    // snapped to the last usable parameter (found by bisection), so surfaces
+    // with asymptotes or domain boundaries (ln, 1/x, sqrt) reach the box
+    // instead of stopping at the nearest grid column.
+    var usable = function (uu, vv, out) {
+      var p;
+      try { p = fn(uu, vv); } catch (e) { return false; }
+      if (!p || !isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) return false;
+      var st = G.clampBox(p, win);
+      if (st === 2) return false;
+      out.p = p;
+      out.cl = st === 1;
+      return true;
+    };
+    var valid0 = valid.slice();
+    var out = {};
+    for (j = 0; j <= nv; j++) {
+      for (i = 0; i <= nu; i++) {
+        k = j * (nu + 1) + i;
+        if (valid0[k]) continue;
+        var ni = -1, nj = -1;
+        if (i > 0 && valid0[k - 1]) { ni = i - 1; nj = j; }
+        else if (i < nu && valid0[k + 1]) { ni = i + 1; nj = j; }
+        else if (j > 0 && valid0[k - (nu + 1)]) { ni = i; nj = j - 1; }
+        else if (j < nv && valid0[k + (nu + 1)]) { ni = i; nj = j + 1; }
+        if (ni === -1) continue;
+        var au = u0 + (u1 - u0) * ni / nu, av = v0 + (v1 - v0) * nj / nv; // usable end
+        var bu = u0 + (u1 - u0) * i / nu, bv = v0 + (v1 - v0) * j / nv;  // unusable end
+        for (var it = 0; it < 18; it++) {
+          var mu = (au + bu) / 2, mv = (av + bv) / 2;
+          if (usable(mu, mv, out)) { au = mu; av = mv; }
+          else { bu = mu; bv = mv; }
+        }
+        if (usable(au, av, out)) {
+          pos[k * 3] = out.p[0]; pos[k * 3 + 1] = out.p[1]; pos[k * 3 + 2] = out.p[2];
+          valid[k] = 1;
+          clamped[k] = out.cl ? 1 : 0;
+        }
+      }
+    }
+
     var indices = [];
     for (j = 0; j < nv; j++) {
       for (i = 0; i < nu; i++) {

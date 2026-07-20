@@ -202,14 +202,7 @@ button { font-family: inherit; cursor: pointer; }
   border: 1px solid #ddd; border-radius: 4px; padding: 2px 4px; background: #fff;
 }
 
-/* docs button & drawer */
-#docsbtn {
-  position: absolute; top: 14px; right: 14px; z-index: 10;
-  width: 36px; height: 36px; border-radius: 50%; border: 1px solid #ccc;
-  background: rgba(255,255,255,0.94); font-size: 17px; font-weight: 600; color: #555;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
-}
-#docsbtn:hover { border-color: #2d70b3; color: #2d70b3; }
+/* docs drawer */
 #docsdrawer {
   position: absolute; top: 0; right: 0; bottom: 0; width: 390px; z-index: 30;
   background: #fff; border-left: 1px solid #ccc;

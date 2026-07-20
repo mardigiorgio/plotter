@@ -652,14 +652,7 @@ button { font-family: inherit; cursor: pointer; }
   border: 1px solid #ddd; border-radius: 4px; padding: 2px 4px; background: #fff;
 }
 
-/* docs button & drawer */
-#docsbtn {
-  position: absolute; top: 14px; right: 14px; z-index: 10;
-  width: 36px; height: 36px; border-radius: 50%; border: 1px solid #ccc;
-  background: rgba(255,255,255,0.94); font-size: 17px; font-weight: 600; color: #555;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
-}
-#docsbtn:hover { border-color: #2d70b3; color: #2d70b3; }
+/* docs drawer */
 #docsdrawer {
   position: absolute; top: 0; right: 0; bottom: 0; width: 390px; z-index: 30;
   background: #fff; border-left: 1px solid #ccc;
@@ -716,7 +709,6 @@ button { font-family: inherit; cursor: pointer; }
   </div>
   <div id="view">
     <div id="canvaswrap"></div>
-    <button id="docsbtn" title="documentation">?</button>
     <div id="viewbtns">
       <button id="zoomin" title="zoom window in">+</button>
       <button id="zoomout" title="zoom window out">&minus;</button>
@@ -2870,6 +2862,47 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         valid[k] = 1;
       }
     }
+    // Domain-edge refinement: an unusable vertex next to a usable one is
+    // snapped to the last usable parameter (found by bisection), so surfaces
+    // with asymptotes or domain boundaries (ln, 1/x, sqrt) reach the box
+    // instead of stopping at the nearest grid column.
+    var usable = function (uu, vv, out) {
+      var p;
+      try { p = fn(uu, vv); } catch (e) { return false; }
+      if (!p || !isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) return false;
+      var st = G.clampBox(p, win);
+      if (st === 2) return false;
+      out.p = p;
+      out.cl = st === 1;
+      return true;
+    };
+    var valid0 = valid.slice();
+    var out = {};
+    for (j = 0; j <= nv; j++) {
+      for (i = 0; i <= nu; i++) {
+        k = j * (nu + 1) + i;
+        if (valid0[k]) continue;
+        var ni = -1, nj = -1;
+        if (i > 0 && valid0[k - 1]) { ni = i - 1; nj = j; }
+        else if (i < nu && valid0[k + 1]) { ni = i + 1; nj = j; }
+        else if (j > 0 && valid0[k - (nu + 1)]) { ni = i; nj = j - 1; }
+        else if (j < nv && valid0[k + (nu + 1)]) { ni = i; nj = j + 1; }
+        if (ni === -1) continue;
+        var au = u0 + (u1 - u0) * ni / nu, av = v0 + (v1 - v0) * nj / nv; // usable end
+        var bu = u0 + (u1 - u0) * i / nu, bv = v0 + (v1 - v0) * j / nv;  // unusable end
+        for (var it = 0; it < 18; it++) {
+          var mu = (au + bu) / 2, mv = (av + bv) / 2;
+          if (usable(mu, mv, out)) { au = mu; av = mv; }
+          else { bu = mu; bv = mv; }
+        }
+        if (usable(au, av, out)) {
+          pos[k * 3] = out.p[0]; pos[k * 3 + 1] = out.p[1]; pos[k * 3 + 2] = out.p[2];
+          valid[k] = 1;
+          clamped[k] = out.cl ? 1 : 0;
+        }
+      }
+    }
+
     var indices = [];
     for (j = 0; j < nv; j++) {
       for (i = 0; i < nu; i++) {
@@ -4849,13 +4882,36 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var res = s.res || 64;
       if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
 
-      // "show in 2D": trace the surface against the unused variable's zero plane
+      // "show in 2D": slice the row's own rendered mesh with the free
+      // variable's zero plane, so domain-edge refinement (asymptotes)
+      // carries over into the flat curve
       if (s.flat2d) {
         var fv = this.flat2dInfo(row);
-        var F2 = fv ? this.implicitFnFor(row) : null;
-        if (F2) {
-          var plane = G.gridPlane(fv, win, this._fastMode ? 32 : 96);
-          return G.intersectionCurve(F2, plane, win, style);
+        if (fv) {
+          s.flat2d = false;
+          var obj3d = null;
+          try { obj3d = this.buildObject(row, spec); } finally { s.flat2d = true; }
+          var meshGeo = null;
+          if (obj3d) {
+            obj3d.traverse(function (o) {
+              if (!meshGeo && o.isMesh && o.geometry.getAttribute('position')) meshGeo = o.geometry;
+            });
+          }
+          if (meshGeo) {
+            var lim = { x: [win.xmin, win.xmax], y: [win.ymin, win.ymax], z: [win.zmin, win.zmax] }[fv];
+            var c0 = Math.max(lim[0], Math.min(lim[1], 0));
+            var ci = { x: 0, y: 1, z: 2 }[fv];
+            var Fc = function (x, y, z) { return [x, y, z][ci] - c0; };
+            var curve = G.intersectionCurve(Fc, meshGeo, win, style);
+            obj3d.traverse(function (o) {
+              if (o.geometry) o.geometry.dispose();
+              if (o.material) {
+                if (o.material.map) o.material.map.dispose();
+                o.material.dispose();
+              }
+            });
+            return curve;
+          }
         }
       }
       var assertFinite = function (p, what) {
@@ -5149,7 +5205,6 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         }
       };
       var closeDocs = function () { drawer.classList.add('hiddenb'); };
-      document.getElementById('docsbtn').addEventListener('click', openDocs);
       document.getElementById('helpbtn').addEventListener('click', openDocs);
       document.getElementById('docsclose').addEventListener('click', closeDocs);
       document.addEventListener('keydown', function (ev) {
@@ -5160,7 +5215,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         if (!ev.target.closest('.popover') && !ev.target.closest('#gsettings')) {
           document.querySelectorAll('.popover').forEach(function (p) { p.classList.add('hiddenb'); });
         }
-        if (!ev.target.closest('#docsdrawer') && !ev.target.closest('#docsbtn') && !ev.target.closest('#helpbtn')) closeDocs();
+        if (!ev.target.closest('#docsdrawer') && !ev.target.closest('#helpbtn')) closeDocs();
         if (!ev.target.closest('.rowsettings') && !ev.target.closest('.gear')) self.closeAllSettings();
         if (!ev.target.closest('.styleflyout') && !ev.target.closest('.swatch')) self.closeAllFlyouts();
       });
