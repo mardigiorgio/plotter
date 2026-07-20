@@ -253,7 +253,7 @@
           a2[0] + (b2[0] - a2[0]) * f, a2[1] + (b2[1] - a2[1]) * f, a2[2] + (b2[2] - a2[2]) * f);
       };
       curveObj.arcLengthDivisions = segs ? 60 : 200;
-      var tube = new THREE.TubeGeometry(curveObj, segs || 300, win.diag * 0.004, segs ? 6 : 8, false);
+      var tube = new THREE.TubeGeometry(curveObj, segs || 300, win.diag * 0.0022, segs ? 6 : 8, false);
       return new THREE.Mesh(tube, surfaceMaterial({ color: style.color, opacity: style.opacity }));
     }
     // gaps → polyline segments
@@ -585,7 +585,7 @@
   /* flat stroked line in the plane {axes[axIdx]=c0}: a thin unlit ribbon */
   G.flatRibbon = function (polylines, axIdx, c0, win, style) {
     // width relative to the vertical range: constant on-screen stroke in 2D
-    var w = (win.ymax - win.ymin) * 0.0028;
+    var w = (win.ymax - win.ymin) * 0.0013;
     var lift = c0 + (win.ymax - win.ymin) * 0.0005; // avoid z-fighting the grid plane
     var ia = axIdx === 0 ? 1 : 0;      // in-plane axis a
     var ib = axIdx === 2 ? 1 : 2;      // in-plane axis b
@@ -751,7 +751,7 @@
         return;
       }
       var curve = new THREE.CatmullRomCurve3(pts, closed);
-      var tube = new THREE.TubeGeometry(curve, Math.min(600, pts.length * 2), win.diag * 0.0045, 8, closed);
+      var tube = new THREE.TubeGeometry(curve, Math.min(600, pts.length * 2), win.diag * 0.0026, 8, closed);
       group.add(new THREE.Mesh(tube, mat));
     });
     return group;
