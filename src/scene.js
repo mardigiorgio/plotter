@@ -1,0 +1,263 @@
+/* scene.js — Three.js viewport: z-up axes, ticks, grid, box, lights, controls. */
+(function () {
+  'use strict';
+  var P = window.P = window.P || {};
+
+  function niceStep(range) {
+    var raw = range / 6;
+    var pow = Math.pow(10, Math.floor(Math.log10(raw)));
+    var cands = [1, 2, 5, 10];
+    for (var i = 0; i < cands.length; i++) {
+      if (cands[i] * pow >= raw - 1e-12) return cands[i] * pow;
+    }
+    return 10 * pow;
+  }
+  function fmtTick(v) {
+    var s = (Math.abs(v) < 1e-10 ? 0 : v).toPrecision(10);
+    return String(parseFloat(s));
+  }
+
+  P.Viewport = function (container) {
+    var self = this;
+    this.container = container;
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer.setClearColor(0xffffff, 1);
+    container.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(40, 1, 0.01, 4000);
+    this.camera.up.set(0, 0, 1);
+
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x556677, 0.85));
+    var dl = new THREE.DirectionalLight(0xffffff, 0.65);
+    dl.position.set(1.5, -2.5, 3);
+    this.scene.add(dl);
+    var dl2 = new THREE.DirectionalLight(0xffffff, 0.25);
+    dl2.position.set(-2, 2, -1.5);
+    this.scene.add(dl2);
+
+    this.decor = new THREE.Group();   // axes, grid, box
+    this.plots = new THREE.Group();   // user objects
+    this.scene.add(this.decor, this.plots);
+    this.objects = {};                // rowId → Object3D
+
+    this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+    this.controls.rotateSpeed = 0.75;
+    // the wheel zooms the WINDOW (axis ranges), not the camera; see onWheelZoom
+    this.controls.enableZoom = false;
+    this.renderer.domElement.addEventListener('wheel', function (ev) {
+      ev.preventDefault();
+      if (self.onWheelZoom) self.onWheelZoom(Math.exp(ev.deltaY * 0.0012));
+    }, { passive: false });
+
+    this.showAxes = true; this.showGrid = true; this.showBox = true;
+
+    this.resize = function () {
+      var w = container.clientWidth, h = container.clientHeight;
+      if (!w || !h) return;
+      self.renderer.setSize(w, h);
+      self.camera.aspect = w / h;
+      self.camera.updateProjectionMatrix();
+    };
+    window.addEventListener('resize', this.resize);
+    if (window.ResizeObserver) new ResizeObserver(this.resize).observe(container);
+
+    var loop = function () {
+      requestAnimationFrame(loop);
+      self.controls.update();
+      self.renderer.render(self.scene, self.camera);
+    };
+    this.resize();
+    loop();
+  };
+
+  P.Viewport.prototype = {
+    setWindow: function (win) {
+      this.win = win;
+      var cx = (win.xmin + win.xmax) / 2, cy = (win.ymin + win.ymax) / 2, cz = (win.zmin + win.zmax) / 2;
+      this.center = new THREE.Vector3(cx, cy, cz);
+      this.controls.target.copy(this.center);
+      this.rebuildDecor();
+    },
+
+    home: function () {
+      var d = this.win.diag;
+      this.camera.position.set(
+        this.center.x + d * 0.85,
+        this.center.y - d * 1.05,
+        this.center.z + d * 0.65);
+      this.controls.target.copy(this.center);
+      this.camera.lookAt(this.center);
+    },
+
+    zoomBy: function (f) {
+      var v = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
+      v.multiplyScalar(f);
+      this.camera.position.copy(this.controls.target).add(v);
+    },
+
+    // scale camera distance about the target so window rescaling keeps the framing
+    scaleView: function (f) {
+      this.zoomBy(f);
+    },
+
+
+    // cheap live scaling of the existing axes/grid/box during zoom gestures
+    // (tick label values lag until the real rebuild at gesture end)
+    scaleDecor: function (f) {
+      this._decorScale = (this._decorScale || 1) * f;
+      var s = this._decorScale, c = this.center;
+      this.decor.scale.setScalar(s);
+      this.decor.position.set(c.x * (1 - s), c.y * (1 - s), c.z * (1 - s));
+    },
+
+    rebuildDecor: function () {
+      var win = this.win, self = this;
+      this._decorScale = 1;
+      this.decor.scale.setScalar(1);
+      this.decor.position.set(0, 0, 0);
+      while (this.decor.children.length) {
+        var dc = this.decor.children[0];
+        dc.traverse(function (o) {
+          if (o.geometry) o.geometry.dispose();
+          if (o.material) {
+            if (o.material.map) o.material.map.dispose();
+            o.material.dispose();
+          }
+        });
+        this.decor.remove(dc);
+      }
+      var d = win.diag;
+      var G = P.geom;
+
+      function line(pts, color, opacity) {
+        var geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
+        var mat = new THREE.LineBasicMaterial({ color: color, transparent: opacity < 1, opacity: opacity });
+        return new THREE.LineSegments(geo, mat);
+      }
+
+      if (this.showGrid) {
+        var pts = [];
+        var sx = niceStep(win.xmax - win.xmin), sy = niceStep(win.ymax - win.ymin);
+        for (var gx = Math.ceil(win.xmin / sx) * sx; gx <= win.xmax + 1e-9; gx += sx) {
+          pts.push(gx, win.ymin, 0, gx, win.ymax, 0);
+        }
+        for (var gy = Math.ceil(win.ymin / sy) * sy; gy <= win.ymax + 1e-9; gy += sy) {
+          pts.push(win.xmin, gy, 0, win.xmax, gy, 0);
+        }
+        if (win.zmin <= 0 && win.zmax >= 0) this.decor.add(line(pts, 0xdddddd, 1));
+      }
+
+      if (this.showBox) {
+        var bg = new THREE.BoxGeometry(win.xmax - win.xmin, win.ymax - win.ymin, win.zmax - win.zmin);
+        var edges = new THREE.LineSegments(new THREE.EdgesGeometry(bg),
+          new THREE.LineBasicMaterial({ color: 0xcccccc }));
+        edges.position.copy(this.center);
+        this.decor.add(edges);
+      }
+
+      if (this.showAxes) {
+        var axInfo = [
+          { dir: [1, 0, 0], min: win.xmin, max: win.xmax, label: 'x', tickDir: [0, 1, 0] },
+          { dir: [0, 1, 0], min: win.ymin, max: win.ymax, label: 'y', tickDir: [1, 0, 0] },
+          { dir: [0, 0, 1], min: win.zmin, max: win.zmax, label: 'z', tickDir: [1, 0, 0] }
+        ];
+        var tickLen = d * 0.008;
+        axInfo.forEach(function (ax) {
+          if (ax.min > 0 || ax.max < 0) return; // axis line only if it passes through window
+          var over = (ax.max - ax.min) * 0.06;
+          var a = ax.dir.map(function (c) { return c * (ax.min - over * 0); });
+          var b = ax.dir.map(function (c) { return c * (ax.max + over); });
+          self.decor.add(line([a[0], a[1], a[2], b[0], b[1], b[2]], 0x555555, 1));
+          // arrow head
+          var head = new THREE.Mesh(new THREE.ConeGeometry(d * 0.008, d * 0.028, 10),
+            new THREE.MeshBasicMaterial({ color: 0x555555 }));
+          head.position.set(b[0], b[1], b[2]);
+          head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(ax.dir[0], ax.dir[1], ax.dir[2]));
+          self.decor.add(head);
+          // axis letter
+          var lab = P.geom.textSprite(ax.label, { color: '#333', worldH: d * 0.034 });
+          lab.position.set(b[0] + ax.dir[0] * d * 0.035, b[1] + ax.dir[1] * d * 0.035, b[2] + ax.dir[2] * d * 0.035);
+          self.decor.add(lab);
+          // ticks + numbers
+          var step = niceStep(ax.max - ax.min);
+          var tickPts = [];
+          for (var t = Math.ceil(ax.min / step) * step; t <= ax.max + 1e-9; t += step) {
+            if (Math.abs(t) < step / 2) continue;
+            var p = ax.dir.map(function (c) { return c * t; });
+            tickPts.push(
+              p[0] - ax.tickDir[0] * tickLen, p[1] - ax.tickDir[1] * tickLen, p[2] - ax.tickDir[2] * tickLen,
+              p[0] + ax.tickDir[0] * tickLen, p[1] + ax.tickDir[1] * tickLen, p[2] + ax.tickDir[2] * tickLen);
+            var num = P.geom.textSprite(fmtTick(t), { color: '#777', worldH: d * 0.022 });
+            num.position.set(
+              p[0] + ax.tickDir[0] * d * 0.03,
+              p[1] + ax.tickDir[1] * d * 0.03,
+              p[2] + ax.tickDir[2] * d * 0.03 - (ax.label !== 'z' ? d * 0.012 : 0));
+            self.decor.add(num);
+          }
+          self.decor.add(line(tickPts, 0x555555, 1));
+        });
+      }
+    },
+
+    setObject: function (id, obj) {
+      this.removeObject(id);
+      if (obj) {
+        this.objects[id] = obj;
+        this.plots.add(obj);
+      }
+    },
+    removeObject: function (id) {
+      var old = this.objects[id];
+      if (old) {
+        this.plots.remove(old);
+        old.traverse(function (o) {
+          if (o.isInstancedMesh) o.dispose(); // frees instanceMatrix GL buffers
+          if (o.geometry) o.geometry.dispose();
+          if (o.material) {
+            if (o.material.map) o.material.map.dispose();
+            o.material.dispose();
+          }
+        });
+        delete this.objects[id];
+      }
+    },
+    setVisible: function (id, on) {
+      if (this.objects[id]) this.objects[id].visible = on;
+    },
+
+    /* focus dimming: focused row's object full strength, others faded */
+    focus: function (id) {
+      var objs = this.objects;
+      Object.keys(objs).forEach(function (key) {
+        objs[key].traverse(function (o) {
+          if (!o.material || o.material._noDim) return;
+          if (o.material._baseOpacity === undefined) {
+            o.material._baseOpacity = o.material.opacity;
+            o.material._baseTransparent = o.material.transparent;
+          }
+          if (key === id) {
+            o.material.opacity = o.material._baseOpacity;
+            o.material.transparent = o.material._baseTransparent;
+          } else {
+            o.material.opacity = o.material._baseOpacity * 0.35;
+            o.material.transparent = true;
+          }
+        });
+      });
+    },
+    unfocus: function () {
+      Object.keys(this.objects).forEach(function (key) {
+        this.objects[key].traverse(function (o) {
+          if (!o.material || o.material._baseOpacity === undefined) return;
+          o.material.opacity = o.material._baseOpacity;
+          o.material.transparent = o.material._baseTransparent;
+        });
+      }, this);
+    }
+  };
+})();

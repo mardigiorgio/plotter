@@ -1,0 +1,29 @@
+<div id="app">
+  <div id="panel">
+    <div id="topbar">
+      <div id="brand">Plotter <span>3D</span></div>
+      <button id="addrow" title="add expression">+</button>
+      <button id="helpbtn" title="examples &amp; help">?</button>
+    </div>
+    <div id="rows"></div>
+    <div id="panelfoot">Try <b>r = 1</b>, <b>theta = pi/4</b>, or <b>rho = 2cos(phi)</b>. Press <b>?</b> for the docs.</div>
+  </div>
+  <div id="view">
+    <div id="canvaswrap"></div>
+    <button id="docsbtn" title="documentation">?</button>
+    <div id="viewbtns">
+      <button id="zoomin" title="zoom window in">+</button>
+      <button id="zoomout" title="zoom window out">&minus;</button>
+      <button id="zoomhome" title="reset view">&#8962;</button>
+      <button id="gsettings" title="window &amp; display settings">&#9881;</button>
+    </div>
+    <div id="gpanel" class="popover hiddenb"></div>
+    <div id="docsdrawer" class="hiddenb">
+      <div id="docshead">
+        <span>Documentation</span>
+        <button id="docsclose" title="close">&times;</button>
+      </div>
+      <div id="docsbody"></div>
+    </div>
+  </div>
+</div>
