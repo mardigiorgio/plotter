@@ -52,6 +52,8 @@
     this._playing = new Set();
 
     var saved = this.load();
+    this.themeName = (saved && saved.view && saved.view.theme === 'dark') ? 'dark' : 'light';
+    this.applyTheme(this.themeName, true);
     this.viewport.onWheelZoom = function (f) { self.wheelZoom(f); };
     this.setWindow(saved && saved.window ? saved.window : { xmin: -4, xmax: 4, ymin: -4, ymax: 4, zmin: -4, zmax: 4 }, true);
     if (saved && saved.view) {
@@ -175,6 +177,13 @@
     },
     closeAllFlyouts: function () {
       this.rows.forEach(function (r) { r.closeFlyout(); });
+    },
+
+    applyTheme: function (name, skipSave) {
+      this.themeName = name;
+      document.documentElement.dataset.theme = name;
+      this.viewport.setTheme(name);
+      if (!skipSave) this.saveSoon();
     },
 
     /* live opacity: mutate materials, no re-tessellation */
@@ -931,6 +940,9 @@
         if (last && last.state.latex === '') { last.mf.focus(); return; }
         self.insertRowAfter(last);
       });
+      document.getElementById('themebtn').addEventListener('click', function () {
+        self.applyTheme(self.themeName === 'dark' ? 'light' : 'dark');
+      });
       var zi = document.getElementById('zoomin'), zo = document.getElementById('zoomout');
       zi.title = 'zoom the window in';
       zo.title = 'zoom the window out to show more space';
@@ -1175,7 +1187,7 @@
       try {
         var state = {
           window: { xmin: this.win.xmin, xmax: this.win.xmax, ymin: this.win.ymin, ymax: this.win.ymax, zmin: this.win.zmin, zmax: this.win.zmax },
-          view: { axes: this.viewport.showAxes, grid: this.viewport.showGrid, box: this.viewport.showBox },
+          view: { axes: this.viewport.showAxes, grid: this.viewport.showGrid, box: this.viewport.showBox, theme: this.themeName },
           rows: this.rows.map(function (r) { return r.serialize(); })
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));

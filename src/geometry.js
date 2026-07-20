@@ -279,7 +279,7 @@
     c2.font = font;
     c2.textBaseline = 'middle';
     if (opts.halo !== false) {
-      c2.lineWidth = 8; c2.strokeStyle = 'rgba(255,255,255,0.9)';
+      c2.lineWidth = 8; c2.strokeStyle = opts.haloColor || 'rgba(255,255,255,0.9)';
       c2.strokeText(text, 8, h / 2);
     }
     c2.fillStyle = opts.color || '#333';
