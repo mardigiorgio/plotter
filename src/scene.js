@@ -154,13 +154,13 @@
           if (xAxisDrawn && Math.abs(gy) < sy * 0.001) continue;
           pts.push(win.xmin, gy, 0, win.xmax, gy, 0);
         }
-        if (win.zmin <= 0 && win.zmax >= 0) this.decor.add(line(pts, 0xdddddd, 1));
+        if (win.zmin <= 0 && win.zmax >= 0) this.decor.add(line(pts, 0xe8eaee, 1));
       }
 
       if (this.showBox) {
         var bg = new THREE.BoxGeometry(win.xmax - win.xmin, win.ymax - win.ymin, win.zmax - win.zmin);
         var edges = new THREE.LineSegments(new THREE.EdgesGeometry(bg),
-          new THREE.LineBasicMaterial({ color: 0xcccccc }));
+          new THREE.LineBasicMaterial({ color: 0xd8dbe0 }));
         edges.position.copy(this.center);
         this.decor.add(edges);
       }
@@ -177,15 +177,15 @@
           var over = (ax.max - ax.min) * 0.06;
           var a = ax.dir.map(function (c) { return c * (ax.min - over * 0); });
           var b = ax.dir.map(function (c) { return c * (ax.max + over); });
-          self.decor.add(line([a[0], a[1], a[2], b[0], b[1], b[2]], 0x555555, 1));
+          self.decor.add(line([a[0], a[1], a[2], b[0], b[1], b[2]], 0x3a3f4a, 1));
           // arrow head
           var head = new THREE.Mesh(new THREE.ConeGeometry(d * 0.008, d * 0.028, 10),
-            new THREE.MeshBasicMaterial({ color: 0x555555 }));
+            new THREE.MeshBasicMaterial({ color: 0x3a3f4a }));
           head.position.set(b[0], b[1], b[2]);
           head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(ax.dir[0], ax.dir[1], ax.dir[2]));
           self.decor.add(head);
           // axis letter
-          var lab = P.geom.textSprite(ax.label, { color: '#333', worldH: d * 0.034 });
+          var lab = P.geom.textSprite(ax.label, { color: '#1a2030', worldH: d * 0.034, italic: true });
           lab.position.set(b[0] + ax.dir[0] * d * 0.035, b[1] + ax.dir[1] * d * 0.035, b[2] + ax.dir[2] * d * 0.035);
           self.decor.add(lab);
           // ticks + numbers
@@ -197,14 +197,14 @@
             tickPts.push(
               p[0] - ax.tickDir[0] * tickLen, p[1] - ax.tickDir[1] * tickLen, p[2] - ax.tickDir[2] * tickLen,
               p[0] + ax.tickDir[0] * tickLen, p[1] + ax.tickDir[1] * tickLen, p[2] + ax.tickDir[2] * tickLen);
-            var num = P.geom.textSprite(fmtTick(t), { color: '#777', worldH: d * 0.022 });
+            var num = P.geom.textSprite(fmtTick(t), { color: '#565d6b', worldH: d * 0.022, serif: true });
             num.position.set(
               p[0] + ax.tickDir[0] * d * 0.03,
               p[1] + ax.tickDir[1] * d * 0.03,
               p[2] + ax.tickDir[2] * d * 0.03 - (ax.label !== 'z' ? d * 0.012 : 0));
             self.decor.add(num);
           }
-          self.decor.add(line(tickPts, 0x555555, 1));
+          self.decor.add(line(tickPts, 0x3a3f4a, 1));
         });
       }
     },

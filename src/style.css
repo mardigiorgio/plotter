@@ -23,13 +23,18 @@ button { font-family: inherit; cursor: pointer; }
   padding: 8px 10px;
   background: #f6f6f6; border-bottom: 1px solid #ddd;
 }
-#brand { font-size: 16px; font-weight: 600; color: #444; flex: 1; }
-#brand span { color: #2d70b3; font-weight: 700; }
-#topbar button {
-  width: 30px; height: 30px; border: 1px solid #ccc; border-radius: 5px;
-  background: #fff; font-size: 17px; color: #555; line-height: 1;
+#brand {
+  font-family: Georgia, 'Times New Roman', serif; font-style: italic;
+  font-size: 17px; font-weight: 600; color: #1a2030; flex: 1;
+  letter-spacing: 0.01em;
 }
-#topbar button:hover { background: #eef4fb; border-color: #2d70b3; color: #2d70b3; }
+#brand span { color: #2d70b3; }
+#topbar button {
+  width: 30px; height: 30px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; font-size: 17px; color: #5a6170; line-height: 1;
+}
+#topbar button:hover { background: #edf1f6; color: #2d70b3; }
+#topbar button:focus-visible, #viewbtns button:focus-visible { outline: 2px solid #2d70b3; outline-offset: 1px; }
 
 #rows { flex: 1; overflow-y: auto; overflow-x: hidden; }
 
@@ -40,8 +45,8 @@ button { font-family: inherit; cursor: pointer; }
   min-height: 48px;
   background: #fff;
 }
-.row.focused { background: #fafcff; }
-.row.focused .gutter { background: #e8eef7; }
+.row.focused { background: #f6f9fd; }
+.row.focused .gutter { background: #e7eef8; }
 
 .gutter {
   width: 44px; min-width: 44px;
@@ -62,11 +67,11 @@ button { font-family: inherit; cursor: pointer; }
 
 .rowmain { flex: 1; min-width: 0; padding: 8px 4px 6px 10px; display: flex; flex-direction: column; justify-content: center; }
 .mq { display: block; }
-.mq .mq-editable-field {
+.mq.mq-editable-field, .mq .mq-editable-field {
   border: none; box-shadow: none; width: 100%;
   font-size: 18px; padding: 2px 4px;
 }
-.mq .mq-editable-field.mq-focused { box-shadow: none; border: none; }
+.mq.mq-editable-field.mq-focused, .mq .mq-editable-field.mq-focused { box-shadow: none; border: none; }
 
 .rowside {
   display: flex; flex-direction: column; align-items: center;
@@ -155,9 +160,9 @@ button { font-family: inherit; cursor: pointer; }
   display: flex; flex-direction: column; gap: 6px; z-index: 10;
 }
 #viewbtns button {
-  width: 36px; height: 36px; border-radius: 7px; border: 1px solid #ccc;
-  background: rgba(255,255,255,0.94); font-size: 17px; color: #555;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+  width: 34px; height: 34px; border-radius: 8px; border: 1px solid #d8dbe0;
+  background: rgba(255,255,255,0.95); font-size: 16px; color: #4a5160;
+  box-shadow: 0 1px 3px rgba(26,32,48,0.1);
 }
 #viewbtns button:hover { border-color: #2d70b3; color: #2d70b3; }
 
@@ -212,12 +217,16 @@ button { font-family: inherit; cursor: pointer; }
 #docshead {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 16px; border-bottom: 1px solid #eee;
-  font-weight: 600; color: #444; font-size: 15px;
+  font-family: Georgia, 'Times New Roman', serif; font-style: italic;
+  font-weight: 600; color: #1a2030; font-size: 16px;
 }
 #docsclose { border: none; background: none; font-size: 22px; color: #999; line-height: 1; }
 #docsclose:hover { color: #444; }
 #docsbody { flex: 1; overflow-y: auto; padding: 6px 16px 20px; }
-.docsec { font-weight: 600; color: #2d70b3; font-size: 13px; margin: 16px 0 5px; }
+.docsec {
+  font-family: Georgia, 'Times New Roman', serif; font-style: italic;
+  font-weight: 600; color: #1a2030; font-size: 14.5px; margin: 18px 0 5px;
+}
 .doctext { font-size: 12.5px; color: #666; line-height: 1.55; }
 .doctext b { color: #444; }
 .doctext i { color: #555; }
@@ -239,8 +248,24 @@ button { font-family: inherit; cursor: pointer; }
 /* window-size toast */
 .wintoast {
   position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-  background: rgba(60,60,60,0.85); color: #fff;
+  background: rgba(26,32,48,0.88); color: #fff;
   padding: 5px 15px; border-radius: 15px; font-size: 13px;
   opacity: 0; transition: opacity 0.25s; pointer-events: none; z-index: 15;
 }
 .wintoast.show { opacity: 1; }
+
+/* empty-state invitation */
+#emptyhint { padding: 26px 18px 10px; }
+.ehtitle {
+  font-family: Georgia, 'Times New Roman', serif; font-style: italic;
+  font-size: 16px; color: #1a2030; margin-bottom: 4px;
+}
+.ehsub { font-size: 12.5px; color: #8a8f99; margin-bottom: 14px; line-height: 1.5; }
+.ehchips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  font-family: Georgia, 'Times New Roman', serif; font-style: italic;
+  font-size: 13.5px; color: #2c3242;
+  border: 1px solid #d8dbe0; border-radius: 999px; background: #fff;
+  padding: 4px 14px;
+}
+.chip:hover { border-color: #2d70b3; color: #2d70b3; background: #f0f5fb; }

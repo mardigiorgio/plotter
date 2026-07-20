@@ -160,6 +160,7 @@
     },
     renumber: function () {
       this.rows.forEach(function (r, i) { r.setIndex(i); });
+      this.updateEmptyHint();
     },
     onRowFocus: function (row) {
       this.rows.forEach(function (r) { r.dom.classList.toggle('focused', r === row); });
@@ -1032,6 +1033,42 @@
       });
 
       this.buildDocs();
+      this.buildEmptyHint();
+    },
+
+    buildEmptyHint: function () {
+      var self = this;
+      var eh = document.getElementById('emptyhint');
+      el('div', 'ehtitle', eh).textContent = 'Type an equation';
+      el('div', 'ehsub', eh).textContent = 'The object type is detected from the math itself. Try one of these:';
+      var chips = el('div', 'ehchips', eh);
+      [
+        ['r = 1', 'r=1'],
+        ['\u03c1 = 2cos \u03c6', '\\rho =2\\cos \\left(\\phi \\right)'],
+        ['z = sin x + cos y', 'z=\\sin \\left(x\\right)+\\cos \\left(y\\right)'],
+        ['x\u00b2 + y\u00b2 + z\u00b2 = 9', 'x^{2}+y^{2}+z^{2}=9']
+      ].forEach(function (pair) {
+        var chipEl = el('button', 'chip', chips);
+        chipEl.textContent = pair[0];
+        chipEl.addEventListener('click', function () {
+          var row = self.rows[0];
+          row._squelch = true;
+          row.mf.latex(pair[1]);
+          row._squelch = false;
+          row.state.latex = row.mf.latex();
+          self.recompute();
+          self.saveSoon();
+          row.mf.focus();
+        });
+      });
+      this.updateEmptyHint();
+    },
+    updateEmptyHint: function () {
+      var eh = document.getElementById('emptyhint');
+      if (!eh) return;
+      var empty = this.rows.length === 1 && !this.rows[0].state.latex;
+      eh.classList.toggle('hiddenb', !empty);
+      if (empty) this.rowsEl.appendChild(eh); // keep it right below the row
     },
 
     buildDocs: function () {

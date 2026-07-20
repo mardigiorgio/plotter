@@ -266,14 +266,17 @@
   G.textSprite = function (text, opts) {
     opts = opts || {};
     var fontPx = 46;
+    var font = opts.italic ? 'italic 500 ' + fontPx + 'px Georgia, serif'
+      : opts.serif ? '500 ' + fontPx + 'px Georgia, serif'
+      : '500 ' + fontPx + 'px system-ui, sans-serif';
     var canvas = document.createElement('canvas');
     var c2 = canvas.getContext('2d');
-    c2.font = '500 ' + fontPx + 'px system-ui, sans-serif';
+    c2.font = font;
     var w = Math.ceil(c2.measureText(text).width) + 16;
     var h = fontPx + 18;
     canvas.width = w; canvas.height = h;
     c2 = canvas.getContext('2d');
-    c2.font = '500 ' + fontPx + 'px system-ui, sans-serif';
+    c2.font = font;
     c2.textBaseline = 'middle';
     if (opts.halo !== false) {
       c2.lineWidth = 8; c2.strokeStyle = 'rgba(255,255,255,0.9)';
