@@ -4795,16 +4795,21 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       this._overWin = nw;
       return true;
     },
-    // coarse refill when a gesture runs off the precomputed region
+    // coarse refill when a gesture runs off the precomputed region (throttled)
     refill2dSoon: function () {
       var self = this;
       if (this._refillRAF) return;
+      var now = performance.now();
+      if (this._lastRefill && now - this._lastRefill < 130) return; // settle catches up
       this._refillRAF = requestAnimationFrame(function () {
         self._refillRAF = null;
+        self._lastRefill = performance.now();
         self._fastMode = true;
+        var t0 = performance.now();
         self.viewport.plotWin2d = self._overWin;
         self.viewport.rebuildDecor();
         self.buildAllGeom();
+        self._lastFastMs = performance.now() - t0;
       });
     },
 
@@ -5136,31 +5141,50 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         return good(p) ? p : null;
       };
       var N = this._fastMode ? 250 : 700;
+      // deep bisection to the domain boundary, then log-spaced samples along
+      // the asymptote so tails curve down as far as double precision allows
+      var LADDER = 22;
+      var ladder = function (edgeT, farT) {
+        var span = Math.abs(farT - edgeT);
+        if (!(span > 0)) return [];
+        var d0 = Math.max(span * 1e-14, 5e-324);
+        var dirn = farT > edgeT ? 1 : -1;
+        var pts2 = [];
+        for (var k = 0; k <= LADDER; k++) {
+          var off = k === 0 ? 0 : d0 * Math.pow(span / d0, k / LADDER);
+          var pp = sample(edgeT + dirn * off);
+          if (pp) pts2.push(pp);
+        }
+        return pts2;
+      };
       var polys = [], cur = null, prevT = a, prevOk = null;
       for (var i = 0; i <= N; i++) {
         var t = a + (b - a) * i / N;
         var p = sample(t);
         if (p && !prevOk && i > 0) {
-          // entering the domain: bisect back to the boundary
+          // entering the domain
           var lo = prevT, hi = t;
-          for (var it = 0; it < 18; it++) {
+          for (var it = 0; it < 90; it++) {
             var mid = (lo + hi) / 2;
+            if (mid === lo || mid === hi) break;
             if (sample(mid)) hi = mid; else lo = mid;
           }
-          cur = [sample(hi) || p];
+          cur = ladder(hi, t);
         }
         if (p) {
           if (!cur) cur = [];
           cur.push(p);
         } else if (prevOk) {
-          // leaving the domain: bisect forward to the boundary
+          // leaving the domain
           var lo2 = prevT, hi2 = t;
-          for (var it2 = 0; it2 < 18; it2++) {
+          for (var it2 = 0; it2 < 90; it2++) {
             var mid2 = (lo2 + hi2) / 2;
+            if (mid2 === lo2 || mid2 === hi2) break;
             if (sample(mid2)) lo2 = mid2; else hi2 = mid2;
           }
-          var edge = sample(lo2);
-          if (edge) cur.push(edge);
+          var down = ladder(lo2, prevT);
+          down.reverse();
+          cur = cur.concat(down);
           if (cur.length > 1) polys.push(cur);
           cur = null;
         }
@@ -5385,6 +5409,22 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       // intersection curves and 2D traces do not move when only the window
       // changes; keep them as-is during zoom gestures, rebuild at settle
       if (this._fastMode && (spec.type === 'intersect' || row.state.flat2d)) return;
+      // the 2D view only draws objects that live in the xy-plane
+      if (this.mode2d) {
+        var eff = spec.type === 'definition' ? spec.render : spec;
+        var t2 = eff.type;
+        var ok2d =
+          t2 === 'point' || t2 === 'namedPoint' || t2 === 'vector' ||
+          t2 === 'curve' || t2 === 'psurf' || spec.type === 'intersect' ||
+          (t2 === 'vfield' && eff.params && eff.params.length === 2) ||
+          (SURFACE_TYPES.indexOf(t2) !== -1 && this.flat2dInfo(row) === 'z');
+        if (!ok2d) {
+          this.viewport.removeObject(row.id);
+          delete this._buildKeys[row.id];
+          row.setError('3D object. Press the 3D button to see it');
+          return;
+        }
+      }
       var key = this.buildKey(row);
       if (this._buildKeys[row.id] === key && this.viewport.objects[row.id]) return;
       this._buildKeys[row.id] = key;
@@ -5410,7 +5450,10 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var s = row.state;
       var style = { color: s.color, opacity: s.opacity, mesh: s.mesh };
       var res = s.res || 64;
-      if (this._fastMode) res = Math.min(res, this.mode2d ? 48 : 24);
+      if (this._fastMode) {
+        var slow = (this._lastFastMs || 0) > 9;
+        res = Math.min(res, this.mode2d ? (slow ? 32 : 48) : (slow ? 16 : 24));
+      }
 
       // "show in 2D" (or global 2D mode): xy-plane curves with a solved form
       // sample directly as 1D polylines (fast, straight past the window edge)
@@ -5468,12 +5511,12 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         case 'phiSurf': return G.phiSurf(P.makeFn(spec.expr, ['rho', 'theta'], env), win, style, res);
         case 'implicit': {
           var iRes = s.res ? Math.max(20, Math.min(96, Math.round(s.res * 0.75))) : 44;
-          if (this._fastMode) iRes = 16;
+          if (this._fastMode) iRes = (this._lastFastMs || 0) > 9 ? 12 : 16;
           return G.implicit(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, iRes);
         }
         case 'region': {
           var rRes = s.res ? Math.max(20, Math.min(80, Math.round(s.res * 0.6))) : 44;
-          if (this._fastMode) rRes = 16;
+          if (this._fastMode) rRes = (this._lastFastMs || 0) > 9 ? 12 : 16;
           return G.region(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, rRes);
         }
         case 'curve': {
@@ -5676,7 +5719,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           self._wheelAccum = 1;
           if (Math.abs(Math.log(step)) > 0.001) {
             self._fastMode = true;
+            var t0 = performance.now();
             self.scaleWindowFast(step);
+            self._lastFastMs = performance.now() - t0;
           }
         });
       }
@@ -5696,6 +5741,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     },
 
     flashWindowSize: function (previewF) {
+      var now = performance.now();
+      if (this._lastFlash && now - this._lastFlash < 80) return;
+      this._lastFlash = now;
       var w = this.win, f = previewF || 1;
       var short = function (v) { return String(parseFloat((v * f).toPrecision(3))); };
       var sym = w.xmin === -w.xmax && w.ymin === -w.ymax && w.zmin === -w.zmax &&
