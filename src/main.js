@@ -194,6 +194,44 @@
       if (!skipSave) this.saveSoon();
     },
 
+    // in 2D everything is computed over ~2.5x the visible region, so pan and
+    // zoom can move only the camera; the region re-centers when gestures settle
+    plotWin: function () {
+      return (this.mode2d && this._overWin) ? this._overWin : this.win;
+    },
+    ensureOverscan: function (force) {
+      if (!this.mode2d) { this._overWin = null; return false; }
+      var w = this.win, o = this._overWin;
+      var xr = w.xmax - w.xmin, yr = w.ymax - w.ymin;
+      var need = force || !o ||
+        w.xmin < o.xmin + xr * 0.1 || w.xmax > o.xmax - xr * 0.1 ||
+        w.ymin < o.ymin + yr * 0.1 || w.ymax > o.ymax - yr * 0.1 ||
+        xr > (o.xmax - o.xmin) / 1.4;
+      if (!need) { o.visYr = yr; return false; }
+      var xc = (w.xmin + w.xmax) / 2, yc = (w.ymin + w.ymax) / 2, F = 2.5;
+      var nw = {
+        xmin: xc - xr * F / 2, xmax: xc + xr * F / 2,
+        ymin: yc - yr * F / 2, ymax: yc + yr * F / 2,
+        zmin: w.zmin, zmax: w.zmax
+      };
+      nw.diag = Math.hypot(nw.xmax - nw.xmin, nw.ymax - nw.ymin, nw.zmax - nw.zmin);
+      nw.visYr = yr;
+      this._overWin = nw;
+      return true;
+    },
+    // coarse refill when a gesture runs off the precomputed region
+    refill2dSoon: function () {
+      var self = this;
+      if (this._refillRAF) return;
+      this._refillRAF = requestAnimationFrame(function () {
+        self._refillRAF = null;
+        self._fastMode = true;
+        self.viewport.plotWin2d = self._overWin;
+        self.viewport.rebuildDecor();
+        self.buildAllGeom();
+      });
+    },
+
     // during continuous interaction (slider drag / play), rebuild coarse and
     // sharpen shortly after the interaction pauses
     interactFast: function () {
@@ -484,6 +522,79 @@
       return null;
     },
 
+    // sample a solved xy-plane form as polylines over the plot window,
+    // splitting at undefined points and bisecting to domain boundaries
+    planarPolylines: function (spec, env, pw) {
+      var map = null, a = 0, b = 1;
+      try {
+        if (spec.type === 'graph' && spec.axis === 'y' && spec.mode === 'cart') {
+          var fy = P.makeFn(spec.expr, ['x', 'z'], env);
+          a = pw.xmin; b = pw.xmax;
+          map = function (t) { return [t, fy(t, 0), 0]; };
+        } else if (spec.type === 'graph' && spec.axis === 'x' && spec.mode === 'cart') {
+          var fx = P.makeFn(spec.expr, ['y', 'z'], env);
+          a = pw.ymin; b = pw.ymax;
+          map = function (t) { return [fx(t, 0), t, 0]; };
+        } else if (spec.type === 'cyl') {
+          var fr = P.makeFn(spec.expr, ['theta', 'z'], env);
+          a = 0; b = 2 * Math.PI;
+          map = function (t) { var r = fr(t, 0); return [r * Math.cos(t), r * Math.sin(t), 0]; };
+        } else if (spec.type === 'thetaSurf' && spec.isConst) {
+          var tc = P.evalConst(spec.expr, env);
+          var R = Math.hypot(Math.max(Math.abs(pw.xmin), pw.xmax), Math.max(Math.abs(pw.ymin), pw.ymax));
+          return [[[0, 0, 0], [R * Math.cos(tc), R * Math.sin(tc), 0]]];
+        }
+      } catch (e) { return null; }
+      if (!map) return null;
+
+      var xr = pw.xmax - pw.xmin, yr = pw.ymax - pw.ymin;
+      var xlo = pw.xmin - xr * 0.25, xhi = pw.xmax + xr * 0.25;
+      var ylo = pw.ymin - yr * 0.25, yhi = pw.ymax + yr * 0.25;
+      var good = function (p) {
+        return p && isFinite(p[0]) && isFinite(p[1]) &&
+          p[0] >= xlo && p[0] <= xhi && p[1] >= ylo && p[1] <= yhi;
+      };
+      var sample = function (t) {
+        var p;
+        try { p = map(t); } catch (e) { p = null; }
+        return good(p) ? p : null;
+      };
+      var N = this._fastMode ? 250 : 700;
+      var polys = [], cur = null, prevT = a, prevOk = null;
+      for (var i = 0; i <= N; i++) {
+        var t = a + (b - a) * i / N;
+        var p = sample(t);
+        if (p && !prevOk && i > 0) {
+          // entering the domain: bisect back to the boundary
+          var lo = prevT, hi = t;
+          for (var it = 0; it < 18; it++) {
+            var mid = (lo + hi) / 2;
+            if (sample(mid)) hi = mid; else lo = mid;
+          }
+          cur = [sample(hi) || p];
+        }
+        if (p) {
+          if (!cur) cur = [];
+          cur.push(p);
+        } else if (prevOk) {
+          // leaving the domain: bisect forward to the boundary
+          var lo2 = prevT, hi2 = t;
+          for (var it2 = 0; it2 < 18; it2++) {
+            var mid2 = (lo2 + hi2) / 2;
+            if (sample(mid2)) lo2 = mid2; else hi2 = mid2;
+          }
+          var edge = sample(lo2);
+          if (edge) cur.push(edge);
+          if (cur.length > 1) polys.push(cur);
+          cur = null;
+        }
+        prevT = t;
+        prevOk = p;
+      }
+      if (cur && cur.length > 1) polys.push(cur);
+      return polys.length ? polys : [];
+    },
+
     meshGeometryFor: function (row) {
       var obj = this.viewport.objects[row.id];
       if (!obj) return null;
@@ -657,7 +768,7 @@
     },
 
     buildKey: function (row) {
-      var spec = row.spec, s = row.state, w = this.win;
+      var spec = row.spec, s = row.state, w = this.plotWin();
       if (spec.type === 'intersect') {
         var pair = this.resolveIsect(row) || [];
         var extras = pair.map(function (r2) {
@@ -719,17 +830,20 @@
     },
 
     buildObject: function (row, spec) {
-      var env = this.env, win = this.win, G = P.geom;
+      var env = this.env, win = this.plotWin(), G = P.geom;
       var s = row.state;
       var style = { color: s.color, opacity: s.opacity, mesh: s.mesh };
       var res = s.res || 64;
-      if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
+      if (this._fastMode) res = Math.min(res, this.mode2d ? 48 : 24);
 
-      // "show in 2D" (or global 2D mode): slice the row's own rendered mesh
-      // with the free variable's zero plane, so domain-edge refinement
-      // (asymptotes) carries over into the flat curve
+      // "show in 2D" (or global 2D mode): xy-plane curves with a solved form
+      // sample directly as 1D polylines (fast, straight past the window edge)
       if (s.flat2d || this.mode2d) {
         var fv = this.flat2dInfo(row);
+        if (fv === 'z') {
+          var polys = this.planarPolylines(spec, env, win);
+          if (polys) return G.flatRibbon(polys, 2, 0, win, style);
+        }
         if (fv) {
           var hadFlat = s.flat2d, hadMode = this.mode2d;
           s.flat2d = false; this.mode2d = false;
@@ -867,7 +981,8 @@
     setWindow: function (w, skipRecompute) {
       w.diag = Math.hypot(w.xmax - w.xmin, w.ymax - w.ymin, w.zmax - w.zmin);
       this.win = w;
-      this.viewport.setWindow(w);
+      if (this.mode2d) this.ensureOverscan(false);
+      this.viewport.setWindow(w, this._overWin);
       if (this._winInputs) {
         for (var k in this._winInputs) this._winInputs[k].value = P.fmtNum(w[k]);
       }
@@ -894,26 +1009,21 @@
       this.flashWindowSize();
     },
 
-    // drag-pan in 2D: window slides under the cursor, coarse rebuilds follow
+    // drag-pan in 2D: only the camera moves; content is already there
     pan2d: function (dx, dy) {
       var w = this.win;
       w.xmin += dx; w.xmax += dx; w.ymin += dy; w.ymax += dy;
       this.viewport.win = w;
       this.viewport.update2dCamera();
+      if (this.ensureOverscan(false)) this.refill2dSoon();
       var self = this;
-      if (!this._panRAF) {
-        this._panRAF = requestAnimationFrame(function () {
-          self._panRAF = null;
-          self._fastMode = true;
-          self.buildAllGeom();
-        });
-      }
       clearTimeout(this._panTimer);
       this._panTimer = setTimeout(function () {
         self._panTimer = null;
         self._fastMode = false;
+        self.ensureOverscan(true);
         self.setWindow(self.win);
-      }, 220);
+      }, 250);
     },
 
     // in 2D the window must match the viewport shape so the grid is edge-to-edge
@@ -954,14 +1064,35 @@
       this.flashWindowSize();
     },
 
-    // scroll wheel: coarse geometry-only steps per frame, one full rebuild at the end
+    // scroll wheel: coarse geometry-only steps per frame, one full rebuild at the end.
+    // In 2D only the camera moves; content is precomputed over the overscan.
     wheelZoom: function (f) {
+      var self = this;
+      if (this.mode2d) {
+        var w = this.win;
+        var span2 = (w.xmax - w.xmin) * f;
+        if (span2 < 1e-3 || span2 > 1e5) return;
+        var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2;
+        w.xmin = cx + (w.xmin - cx) * f; w.xmax = cx + (w.xmax - cx) * f;
+        w.ymin = cy + (w.ymin - cy) * f; w.ymax = cy + (w.ymax - cy) * f;
+        this.viewport.win = w;
+        this.viewport.update2dCamera();
+        this.flashWindowSize();
+        if (this.ensureOverscan(false)) this.refill2dSoon();
+        clearTimeout(this._wheelTimer);
+        this._wheelTimer = setTimeout(function () {
+          self._wheelTimer = null;
+          self._fastMode = false;
+          self.ensureOverscan(true);
+          self.setWindow(self.win);
+        }, 220);
+        return;
+      }
       var acc = (this._wheelAccum || 1) * f;
       var span = this.win.xmax - this.win.xmin;
       if (span * acc < 1e-3) acc = 1e-3 / span;
       if (span * acc > 1e5) acc = 1e5 / span;
       this._wheelAccum = acc;
-      var self = this;
       if (!this._wheelRAF) {
         this._wheelRAF = requestAnimationFrame(function () {
           self._wheelRAF = null;
@@ -1023,8 +1154,16 @@
         self.mode2d = !self.mode2d;
         self.viewport.setMode2d(self.mode2d);
         syncDim();
-        if (self.mode2d) self.applyAspect2d(); // triggers recompute via setWindow
-        else self.recompute();
+        if (self.mode2d) { self.ensureOverscan(true); self.applyAspect2d(); }
+        else {
+          // re-square the window: 2D stretched x to the viewport aspect
+          self._overWin = null;
+          var w2 = self.win;
+          var yr2 = w2.ymax - w2.ymin, xc2 = (w2.xmin + w2.xmax) / 2;
+          w2.xmin = xc2 - yr2 / 2;
+          w2.xmax = xc2 + yr2 / 2;
+          self.setWindow(w2);
+        }
         self.saveSoon();
       });
       var zi = document.getElementById('zoomin'), zo = document.getElementById('zoomout');

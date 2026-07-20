@@ -584,9 +584,10 @@
 
   /* flat stroked line in the plane {axes[axIdx]=c0}: a thin unlit ribbon */
   G.flatRibbon = function (polylines, axIdx, c0, win, style) {
-    // width relative to the vertical range: constant on-screen stroke in 2D
-    var w = (win.ymax - win.ymin) * 0.0013;
-    var lift = c0 + (win.ymax - win.ymin) * 0.0005; // avoid z-fighting the grid plane
+    // width relative to the VISIBLE vertical range: constant on-screen stroke
+    var vy = win.visYr || (win.ymax - win.ymin);
+    var w = vy * 0.0012;
+    var lift = c0 + vy * 0.0005; // avoid z-fighting the grid plane
     var ia = axIdx === 0 ? 1 : 0;      // in-plane axis a
     var ib = axIdx === 2 ? 1 : 2;      // in-plane axis b
     var positions = [], indices = [];

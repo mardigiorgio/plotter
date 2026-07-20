@@ -177,8 +177,9 @@
       this._needsRender = true;
     },
 
-    setWindow: function (win) {
+    setWindow: function (win, plotWin2d) {
       this.win = win;
+      this.plotWin2d = plotWin2d || null;
       var cx = (win.xmin + win.xmax) / 2, cy = (win.ymin + win.ymax) / 2, cz = (win.zmin + win.zmax) / 2;
       this.center = new THREE.Vector3(cx, cy, cz);
       this.controls.target.copy(this.center);
@@ -324,41 +325,42 @@
       }
     },
 
-    // flat Desmos-style plane: minor + major grid, axes, numbers at majors
+    // flat Desmos-style plane over the OVERSCAN region: grid and labels stay
+    // put while the camera pans, and are re-centered when the gesture settles
     build2dDecor: function (line) {
-      var win = this.win, T = this.theme, self = this;
+      var win = this.win, T = this.theme;
+      var pw = this.plotWin2d || win;
       var xr = win.xmax - win.xmin, yr = win.ymax - win.ymin;
-      var step = niceStep(yr);
+      var step = niceStep(yr); // spacing from the VISIBLE zoom level
       var minor = step / 5;
       var minorPts = [], majorPts = [];
       var g0;
       if (this.showGrid) {
-        for (g0 = Math.ceil(win.xmin / minor) * minor; g0 <= win.xmax + 1e-9; g0 += minor) {
+        for (g0 = Math.ceil(pw.xmin / minor) * minor; g0 <= pw.xmax + 1e-9; g0 += minor) {
           var isMaj = Math.abs(g0 / step - Math.round(g0 / step)) < 1e-6;
-          (isMaj ? majorPts : minorPts).push(g0, win.ymin, 0, g0, win.ymax, 0);
+          (isMaj ? majorPts : minorPts).push(g0, pw.ymin, 0, g0, pw.ymax, 0);
         }
-        for (g0 = Math.ceil(win.ymin / minor) * minor; g0 <= win.ymax + 1e-9; g0 += minor) {
+        for (g0 = Math.ceil(pw.ymin / minor) * minor; g0 <= pw.ymax + 1e-9; g0 += minor) {
           var isMaj2 = Math.abs(g0 / step - Math.round(g0 / step)) < 1e-6;
-          (isMaj2 ? majorPts : minorPts).push(win.xmin, g0, 0, win.xmax, g0, 0);
+          (isMaj2 ? majorPts : minorPts).push(pw.xmin, g0, 0, pw.xmax, g0, 0);
         }
         this.decor.add(line(minorPts, T.grid, 0.45));
         this.decor.add(line(majorPts, T.grid, 1));
       }
       if (!this.showAxes) return;
-      // axis lines
-      if (win.ymin <= 0 && win.ymax >= 0) this.decor.add(line([win.xmin, 0, 0, win.xmax, 0, 0], T.axis, 1));
-      if (win.xmin <= 0 && win.xmax >= 0) this.decor.add(line([0, win.ymin, 0, 0, win.ymax, 0], T.axis, 1));
-      // numbers at majors, pinned near the axes
+      if (pw.ymin <= 0 && pw.ymax >= 0) this.decor.add(line([pw.xmin, 0, 0, pw.xmax, 0, 0], T.axis, 1));
+      if (pw.xmin <= 0 && pw.xmax >= 0) this.decor.add(line([0, pw.ymin, 0, 0, pw.ymax, 0], T.axis, 1));
+      // numbers at majors across the overscan, pinned near the axes
       var wh = yr * 0.023;
-      var ay = Math.max(win.ymin + yr * 0.03, Math.min(win.ymax - yr * 0.03, 0)); // x-label baseline
-      var ax = Math.max(win.xmin + xr * 0.02, Math.min(win.xmax - xr * 0.02, 0)); // y-label baseline
-      for (g0 = Math.ceil(win.xmin / step) * step; g0 <= win.xmax + 1e-9; g0 += step) {
+      var ay = Math.max(win.ymin + yr * 0.03, Math.min(win.ymax - yr * 0.03, 0));
+      var ax = Math.max(win.xmin + xr * 0.02, Math.min(win.xmax - xr * 0.02, 0));
+      for (g0 = Math.ceil(pw.xmin / step) * step; g0 <= pw.xmax + 1e-9; g0 += step) {
         if (Math.abs(g0) < step / 2) continue;
         var nx = P.geom.textSprite(fmtTick(g0), { color: T.tick, worldH: wh, serif: true, haloColor: T.halo });
         nx.position.set(g0, ay - yr * 0.022, 0.01);
         this.decor.add(nx);
       }
-      for (g0 = Math.ceil(win.ymin / step) * step; g0 <= win.ymax + 1e-9; g0 += step) {
+      for (g0 = Math.ceil(pw.ymin / step) * step; g0 <= pw.ymax + 1e-9; g0 += step) {
         if (Math.abs(g0) < step / 2) continue;
         var ny = P.geom.textSprite(fmtTick(g0), { color: T.tick, worldH: wh, serif: true, haloColor: T.halo });
         ny.position.set(ax - xr * 0.016, g0, 0.01);
