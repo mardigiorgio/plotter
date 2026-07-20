@@ -37,9 +37,9 @@
   P.Viewport = function (container) {
     var self = this;
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
-    this.renderer.setClearColor(0x000000, 0); // CSS gradient shows through
+    this.renderer.setClearColor(P.THEMES.light.fog, 1); // opaque: no compositor blend
     container.appendChild(this.renderer.domElement);
 
     this.theme = P.THEMES.light;
@@ -47,6 +47,8 @@
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.01, 4000);
     this.camera.up.set(0, 0, 1);
 
+    this.camera2d = new THREE.OrthographicCamera(-1, 1, 1, -1, -1000, 1000);
+    this.camera2d.up.set(0, 1, 0);
     this._hemi = new THREE.HemisphereLight(0xffffff, 0x556677, 0.85);
     this.scene.add(this._hemi);
     this._dl1 = new THREE.DirectionalLight(0xffffff, 0.65);
@@ -66,12 +68,33 @@
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.rotateSpeed = 0.75;
+    this._needsRender = true;
+    this.controls.addEventListener('change', function () { self._needsRender = true; });
     // the wheel zooms the WINDOW (axis ranges), not the camera; see onWheelZoom
     this.controls.enableZoom = false;
     this.renderer.domElement.addEventListener('wheel', function (ev) {
       ev.preventDefault();
       if (self.onWheelZoom) self.onWheelZoom(Math.exp(ev.deltaY * 0.0012));
     }, { passive: false });
+    var panLast = null;
+    this.renderer.domElement.addEventListener('pointerdown', function (ev) {
+      if (self.mode2d && ev.button === 0) {
+        panLast = [ev.clientX, ev.clientY];
+        self.renderer.domElement.setPointerCapture(ev.pointerId);
+      }
+    });
+    this.renderer.domElement.addEventListener('pointermove', function (ev) {
+      if (self.mode2d && panLast && self.onPan2d) {
+        var wEl = self.renderer.domElement.clientWidth, hEl = self.renderer.domElement.clientHeight;
+        var dx = (ev.clientX - panLast[0]) / wEl * (self.win.xmax - self.win.xmin);
+        var dy = (ev.clientY - panLast[1]) / hEl * (self.win.ymax - self.win.ymin);
+        panLast = [ev.clientX, ev.clientY];
+        self.onPan2d(-dx, dy);
+      }
+    });
+    ['pointerup', 'pointercancel'].forEach(function (evn) {
+      self.renderer.domElement.addEventListener(evn, function () { panLast = null; });
+    });
 
     this.showAxes = true; this.showGrid = true; this.showBox = true;
 
@@ -81,14 +104,17 @@
       self.renderer.setSize(w, h);
       self.camera.aspect = w / h;
       self.camera.updateProjectionMatrix();
+      if (self.mode2d && self.onResize2d) self.onResize2d();
+      self._needsRender = true;
     };
     window.addEventListener('resize', this.resize);
     if (window.ResizeObserver) new ResizeObserver(this.resize).observe(container);
 
     var loop = function () {
       requestAnimationFrame(loop);
-      self.controls.update();
+      var moved = self.controls.update();
       if (self._pops.length) {
+        self._needsRender = true;
         var now = performance.now();
         for (var pi = self._pops.length - 1; pi >= 0; pi--) {
           var pp = self._pops[pi];
@@ -105,21 +131,50 @@
           pp.obj.position.set(self.center.x * (1 - sc), self.center.y * (1 - sc), self.center.z * (1 - sc));
         }
       }
-      self.renderer.render(self.scene, self.camera);
+      if (moved || self._needsRender) {
+        self.renderer.render(self.scene, self.mode2d ? self.camera2d : self.camera);
+        self._needsRender = false;
+      }
     };
     this.resize();
     loop();
   };
 
   P.Viewport.prototype = {
+    requestRender: function () { this._needsRender = true; },
+
+    setMode2d: function (on) {
+      this.mode2d = on;
+      this.controls.enabled = !on;
+      if (this.win) {
+        if (on) this.update2dCamera();
+        else { this.camera.up.set(0, 0, 1); this.home(); }
+        this.rebuildDecor();
+      }
+      this._needsRender = true;
+    },
+
+    // the ortho frustum IS the window: world units map 1:1 onto the screen
+    update2dCamera: function () {
+      var w = this.win, c = this.camera2d;
+      c.left = w.xmin; c.right = w.xmax; c.top = w.ymax; c.bottom = w.ymin;
+      c.position.set((w.xmin + w.xmax) / 2, (w.ymin + w.ymax) / 2, 100);
+      c.lookAt((w.xmin + w.xmax) / 2, (w.ymin + w.ymax) / 2, 0);
+      c.updateProjectionMatrix();
+      this._needsRender = true;
+    },
+
     setTheme: function (name) {
       var T = this.theme = P.THEMES[name] || P.THEMES.light;
+      P.geom.clearSpriteCache();
+      this.renderer.setClearColor(T.fog, 1);
       this._hemi.color.setHex(T.hemiSky);
       this._hemi.groundColor.setHex(T.hemiGround);
       this._hemi.intensity = T.hemiInt;
       this._dl1.intensity = T.dl1;
       this._dl2.intensity = T.dl2;
       if (this.win) this.rebuildDecor();
+      this._needsRender = true;
     },
 
     setWindow: function (win) {
@@ -127,10 +182,13 @@
       var cx = (win.xmin + win.xmax) / 2, cy = (win.ymin + win.ymax) / 2, cz = (win.zmin + win.zmax) / 2;
       this.center = new THREE.Vector3(cx, cy, cz);
       this.controls.target.copy(this.center);
+      if (this.mode2d) this.update2dCamera();
       this.rebuildDecor();
     },
 
     home: function () {
+      if (this.mode2d) { this.update2dCamera(); return; }
+      this._needsRender = true;
       var d = this.win.diag;
       this.camera.position.set(
         this.center.x + d * 0.85,
@@ -144,6 +202,7 @@
       var v = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
       v.multiplyScalar(f);
       this.camera.position.copy(this.controls.target).add(v);
+      this._needsRender = true;
     },
 
     // scale camera distance about the target so window rescaling keeps the framing
@@ -159,10 +218,12 @@
       var s = this._decorScale, c = this.center;
       this.decor.scale.setScalar(s);
       this.decor.position.set(c.x * (1 - s), c.y * (1 - s), c.z * (1 - s));
+      this._needsRender = true;
     },
 
     rebuildDecor: function () {
       var win = this.win, self = this;
+      this._needsRender = true;
       this._decorScale = 1;
       this.decor.scale.setScalar(1);
       this.decor.position.set(0, 0, 0);
@@ -171,7 +232,7 @@
         dc.traverse(function (o) {
           if (o.geometry) o.geometry.dispose();
           if (o.material) {
-            if (o.material.map) o.material.map.dispose();
+            if (o.material.map && !o.material.map._shared) o.material.map.dispose();
             o.material.dispose();
           }
         });
@@ -179,13 +240,18 @@
       }
       var d = win.diag;
       var T = this.theme;
-      this.scene.fog = new THREE.Fog(T.fog, d * 1.6, d * 4.5);
+      this.scene.fog = this.mode2d ? null : new THREE.Fog(T.fog, d * 1.6, d * 4.5);
 
       function line(pts, color, opacity) {
         var geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
         var mat = new THREE.LineBasicMaterial({ color: color, transparent: opacity < 1, opacity: opacity });
         return new THREE.LineSegments(geo, mat);
+      }
+
+      if (this.mode2d) {
+        this.build2dDecor(line);
+        return;
       }
 
       if (this.showGrid) {
@@ -205,7 +271,7 @@
         if (win.zmin <= 0 && win.zmax >= 0) this.decor.add(line(pts, T.grid, 1));
       }
 
-      if (this.showBox) {
+      if (this.showBox && !this.mode2d) {
         var bg = new THREE.BoxGeometry(win.xmax - win.xmin, win.ymax - win.ymin, win.zmax - win.zmin);
         var edges = new THREE.LineSegments(new THREE.EdgesGeometry(bg),
           new THREE.LineBasicMaterial({ color: T.box }));
@@ -219,6 +285,7 @@
           { dir: [0, 1, 0], min: win.ymin, max: win.ymax, label: 'y', tickDir: [1, 0, 0] },
           { dir: [0, 0, 1], min: win.zmin, max: win.zmax, label: 'z', tickDir: [1, 0, 0] }
         ];
+        if (this.mode2d) axInfo = axInfo.slice(0, 2);
         var tickLen = d * 0.008;
         axInfo.forEach(function (ax) {
           if (ax.min > 0 || ax.max < 0) return; // axis line only if it passes through window
@@ -257,6 +324,48 @@
       }
     },
 
+    // flat Desmos-style plane: minor + major grid, axes, numbers at majors
+    build2dDecor: function (line) {
+      var win = this.win, T = this.theme, self = this;
+      var xr = win.xmax - win.xmin, yr = win.ymax - win.ymin;
+      var step = niceStep(yr);
+      var minor = step / 5;
+      var minorPts = [], majorPts = [];
+      var g0;
+      if (this.showGrid) {
+        for (g0 = Math.ceil(win.xmin / minor) * minor; g0 <= win.xmax + 1e-9; g0 += minor) {
+          var isMaj = Math.abs(g0 / step - Math.round(g0 / step)) < 1e-6;
+          (isMaj ? majorPts : minorPts).push(g0, win.ymin, 0, g0, win.ymax, 0);
+        }
+        for (g0 = Math.ceil(win.ymin / minor) * minor; g0 <= win.ymax + 1e-9; g0 += minor) {
+          var isMaj2 = Math.abs(g0 / step - Math.round(g0 / step)) < 1e-6;
+          (isMaj2 ? majorPts : minorPts).push(win.xmin, g0, 0, win.xmax, g0, 0);
+        }
+        this.decor.add(line(minorPts, T.grid, 0.45));
+        this.decor.add(line(majorPts, T.grid, 1));
+      }
+      if (!this.showAxes) return;
+      // axis lines
+      if (win.ymin <= 0 && win.ymax >= 0) this.decor.add(line([win.xmin, 0, 0, win.xmax, 0, 0], T.axis, 1));
+      if (win.xmin <= 0 && win.xmax >= 0) this.decor.add(line([0, win.ymin, 0, 0, win.ymax, 0], T.axis, 1));
+      // numbers at majors, pinned near the axes
+      var wh = yr * 0.023;
+      var ay = Math.max(win.ymin + yr * 0.03, Math.min(win.ymax - yr * 0.03, 0)); // x-label baseline
+      var ax = Math.max(win.xmin + xr * 0.02, Math.min(win.xmax - xr * 0.02, 0)); // y-label baseline
+      for (g0 = Math.ceil(win.xmin / step) * step; g0 <= win.xmax + 1e-9; g0 += step) {
+        if (Math.abs(g0) < step / 2) continue;
+        var nx = P.geom.textSprite(fmtTick(g0), { color: T.tick, worldH: wh, serif: true, haloColor: T.halo });
+        nx.position.set(g0, ay - yr * 0.022, 0.01);
+        this.decor.add(nx);
+      }
+      for (g0 = Math.ceil(win.ymin / step) * step; g0 <= win.ymax + 1e-9; g0 += step) {
+        if (Math.abs(g0) < step / 2) continue;
+        var ny = P.geom.textSprite(fmtTick(g0), { color: T.tick, worldH: wh, serif: true, haloColor: T.halo });
+        ny.position.set(ax - xr * 0.016, g0, 0.01);
+        this.decor.add(ny);
+      }
+    },
+
     setObject: function (id, obj) {
       var isNew = !this.objects[id];
       this.removeObject(id);
@@ -265,16 +374,18 @@
         this.plots.add(obj);
         if (isNew && !P.reducedMotion) this._pops.push({ obj: obj, t0: performance.now() });
       }
+      this._needsRender = true;
     },
     removeObject: function (id) {
       var old = this.objects[id];
+      this._needsRender = true;
       if (old) {
         this.plots.remove(old);
         old.traverse(function (o) {
           if (o.isInstancedMesh) o.dispose(); // frees instanceMatrix GL buffers
           if (o.geometry) o.geometry.dispose();
           if (o.material) {
-            if (o.material.map) o.material.map.dispose();
+            if (o.material.map && !o.material.map._shared) o.material.map.dispose();
             o.material.dispose();
           }
         });
@@ -283,10 +394,12 @@
     },
     setVisible: function (id, on) {
       if (this.objects[id]) this.objects[id].visible = on;
+      this._needsRender = true;
     },
 
     /* focus dimming: focused row's object full strength, others faded */
     focus: function (id) {
+      this._needsRender = true;
       var objs = this.objects;
       Object.keys(objs).forEach(function (key) {
         objs[key].traverse(function (o) {
@@ -306,6 +419,7 @@
       });
     },
     unfocus: function () {
+      this._needsRender = true;
       Object.keys(this.objects).forEach(function (key) {
         this.objects[key].traverse(function (o) {
           if (!o.material || o.material._baseOpacity === undefined) return;

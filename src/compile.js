@@ -208,19 +208,14 @@
   P.makeTupleFn = function (node, paramNames, env) {
     if (node.t === 'tuple') {
       if (node.items.length !== 3 && node.items.length !== 2) cErr('expected 2 or 3 components ( , , )');
-      var fns = node.items.map(function (item) { return P.makeFn(item, paramNames, env); });
-      if (fns.length === 2) {
-        // 2-component tuples live in the xy-plane
-        return function () {
-          return [fns[0].apply(null, arguments), fns[1].apply(null, arguments), 0];
-        };
-      }
-      return function () {
-        var a = fns[0].apply(null, arguments);
-        var b = fns[1].apply(null, arguments);
-        var c = fns[2].apply(null, arguments);
-        return [a, b, c];
-      };
+      // one fused function: single compile, one array per call, no apply hops
+      var ctx = { params: new Set(paramNames), env: env };
+      var parts = node.items.map(function (item) { return gen(item, ctx); });
+      if (parts.length === 2) parts.push('0'); // 2-component tuples live in the xy-plane
+      var args = paramNames.map(function (p2) { return '_' + p2; });
+      var src = 'return function(' + args.join(',') + '){return [' + parts.join(',') + '];};';
+      /* eslint-disable no-new-func */
+      return new Function('__C', '__FN', '__RT', src)(env.constVals, env.funcJS, RT);
     }
     if (node.t === 'apply' && env.funcs[node.head] && env.funcs[node.head].isTuple) {
       var fname = node.head, fdef = env.funcs[fname];
@@ -257,6 +252,15 @@
       return env.funcJS[node.head].apply(null, vals);
     }
     cErr('expected a point (a, b, c)');
+  };
+
+  /* constant evaluator compiled once, callable many times (sliders animate) */
+  P.makeTupleConstFn = function (node, env) {
+    if (node.t === 'var' && Array.isArray(env.constVals[node.name])) {
+      var nm = node.name;
+      return function () { return env.constVals[nm].slice(); };
+    }
+    return P.makeTupleFn(node, [], env);
   };
 
   P.prettyName = function (name) {

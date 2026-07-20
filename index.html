@@ -779,6 +779,13 @@ button { font-family: inherit; cursor: pointer; }
   opacity: 0; transition: opacity 0.25s; pointer-events: none; z-index: 15;
 }
 .wintoast.show { opacity: 1; }
+
+/* docs reference rows */
+.reflist { display: flex; flex-direction: column; gap: 1px; }
+.refrow { display: flex; gap: 10px; font-size: 12.5px; line-height: 1.7; }
+.refk { min-width: 150px; color: var(--text); }
+.refv { color: var(--muted); }
+.refk b { font-weight: 600; color: var(--text); }
 </style>
 </head>
 <body>
@@ -796,6 +803,7 @@ button { font-family: inherit; cursor: pointer; }
   <div id="view">
     <div id="canvaswrap"></div>
     <div id="viewbtns">
+      <button id="dimbtn" title="flat top-down 2D view">2D</button>
       <button id="zoomin" title="zoom window in">+</button>
       <button id="zoomout" title="zoom window out">&minus;</button>
       <button id="zoomhome" title="reset view">&#8962;</button>
@@ -2588,19 +2596,14 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
   P.makeTupleFn = function (node, paramNames, env) {
     if (node.t === 'tuple') {
       if (node.items.length !== 3 && node.items.length !== 2) cErr('expected 2 or 3 components ( , , )');
-      var fns = node.items.map(function (item) { return P.makeFn(item, paramNames, env); });
-      if (fns.length === 2) {
-        // 2-component tuples live in the xy-plane
-        return function () {
-          return [fns[0].apply(null, arguments), fns[1].apply(null, arguments), 0];
-        };
-      }
-      return function () {
-        var a = fns[0].apply(null, arguments);
-        var b = fns[1].apply(null, arguments);
-        var c = fns[2].apply(null, arguments);
-        return [a, b, c];
-      };
+      // one fused function: single compile, one array per call, no apply hops
+      var ctx = { params: new Set(paramNames), env: env };
+      var parts = node.items.map(function (item) { return gen(item, ctx); });
+      if (parts.length === 2) parts.push('0'); // 2-component tuples live in the xy-plane
+      var args = paramNames.map(function (p2) { return '_' + p2; });
+      var src = 'return function(' + args.join(',') + '){return [' + parts.join(',') + '];};';
+      /* eslint-disable no-new-func */
+      return new Function('__C', '__FN', '__RT', src)(env.constVals, env.funcJS, RT);
     }
     if (node.t === 'apply' && env.funcs[node.head] && env.funcs[node.head].isTuple) {
       var fname = node.head, fdef = env.funcs[fname];
@@ -2637,6 +2640,15 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       return env.funcJS[node.head].apply(null, vals);
     }
     cErr('expected a point (a, b, c)');
+  };
+
+  /* constant evaluator compiled once, callable many times (sliders animate) */
+  P.makeTupleConstFn = function (node, env) {
+    if (node.t === 'var' && Array.isArray(env.constVals[node.name])) {
+      var nm = node.name;
+      return function () { return env.constVals[nm].slice(); };
+    }
+    return P.makeTupleFn(node, [], env);
   };
 
   P.prettyName = function (name) {
@@ -2916,14 +2928,16 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
   // (asymptotes) are invalid so no cell bridges the box.
   G.clampBox = function (p, win) {
     // returns 0 = inside, 1 = clamped onto wall, 2 = far outside
-    var lim = [win.xmin, win.xmax, win.ymin, win.ymax, win.zmin, win.zmax];
-    var state = 0;
-    for (var c = 0; c < 3; c++) {
-      var lo = lim[c * 2], hi = lim[c * 2 + 1], far = (hi - lo) * 0.5;
-      if (p[c] < lo - far || p[c] > hi + far) return 2;
-      if (p[c] < lo) { p[c] = lo; state = 1; }
-      else if (p[c] > hi) { p[c] = hi; state = 1; }
-    }
+    var state = 0, lo, hi, far, v;
+    lo = win.xmin; hi = win.xmax; far = (hi - lo) * 0.5; v = p[0];
+    if (v < lo - far || v > hi + far) return 2;
+    if (v < lo) { p[0] = lo; state = 1; } else if (v > hi) { p[0] = hi; state = 1; }
+    lo = win.ymin; hi = win.ymax; far = (hi - lo) * 0.5; v = p[1];
+    if (v < lo - far || v > hi + far) return 2;
+    if (v < lo) { p[1] = lo; state = 1; } else if (v > hi) { p[1] = hi; state = 1; }
+    lo = win.zmin; hi = win.zmax; far = (hi - lo) * 0.5; v = p[2];
+    if (v < lo - far || v > hi + far) return 2;
+    if (v < lo) { p[2] = lo; state = 1; } else if (v > hi) { p[2] = hi; state = 1; }
     return state;
   };
 
@@ -2964,7 +2978,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     };
     var valid0 = valid.slice();
     var out = {};
-    for (j = 0; j <= nv; j++) {
+    var refine = nu > 24 && nv > 24; // skip during coarse gesture rebuilds
+    for (j = 0; refine && j <= nv; j++) {
       for (i = 0; i <= nu; i++) {
         k = j * (nu + 1) + i;
         if (valid0[k]) continue;
@@ -3006,14 +3021,14 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     var mesh = new THREE.Mesh(geo, surfaceMaterial(style));
     var group = new THREE.Group();
     group.add(mesh);
-    if (style.mesh) group.add(G.gridLines(fn, u0, u1, v0, v1, win));
+    if (style.mesh) group.add(G.gridLines(fn, u0, u1, v0, v1, win, nu <= 24 || nv <= 24));
     return group;
   };
 
   /* coarse parameter-space grid lines drawn on the surface */
-  G.gridLines = function (fn, u0, u1, v0, v1, win) {
+  G.gridLines = function (fn, u0, u1, v0, v1, win, coarse) {
     var pts = [];
-    var NL = 12, NS = 48; // NL lines each way, NS segments per line
+    var NL = coarse ? 6 : 12, NS = coarse ? 16 : 48; // lines each way, segments per line
     function sample(uu, vv) {
       var p;
       try { p = fn(uu, vv); } catch (e) { return null; }
@@ -3100,8 +3115,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
   };
 
   /* ---------- space curve ---------- */
-  G.curve = function (fn, t0, t1, win, style) {
-    var N = 400, limit = win.diag * 2.5;
+  G.curve = function (fn, t0, t1, win, style, segs, flat) {
+    var N = segs ? 120 : 400, limit = win.diag * 2.5;
     var samples = [], allOk = true;
     for (var i = 0; i <= N; i++) {
       var t = t0 + (t1 - t0) * i / N, p;
@@ -3111,13 +3126,24 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       samples.push(ok ? p : null);
       if (!ok) allOk = false;
     }
+    if (allOk && flat) {
+      var planar = true;
+      for (var fi = 0; fi <= N && planar; fi++) {
+        if (Math.abs(samples[fi][2]) > win.diag * 1e-6) planar = false;
+      }
+      if (planar) return G.flatRibbon([samples], 2, 0, win, style);
+    }
     if (allOk) {
       var curveObj = new THREE.Curve();
+      // lerp the samples we already have instead of re-calling fn
       curveObj.getPoint = function (q, target) {
-        var p2 = fn(t0 + (t1 - t0) * q);
-        return (target || new THREE.Vector3()).set(p2[0], p2[1], p2[2]);
+        var x = q * N, i0 = Math.min(Math.floor(x), N - 1), f = x - i0;
+        var a2 = samples[i0], b2 = samples[i0 + 1];
+        return (target || new THREE.Vector3()).set(
+          a2[0] + (b2[0] - a2[0]) * f, a2[1] + (b2[1] - a2[1]) * f, a2[2] + (b2[2] - a2[2]) * f);
       };
-      var tube = new THREE.TubeGeometry(curveObj, 300, win.diag * 0.004, 8, false);
+      curveObj.arcLengthDivisions = segs ? 60 : 200;
+      var tube = new THREE.TubeGeometry(curveObj, segs || 300, win.diag * 0.004, segs ? 6 : 8, false);
       return new THREE.Mesh(tube, surfaceMaterial({ color: style.color, opacity: style.opacity }));
     }
     // gaps → polyline segments
@@ -3141,33 +3167,47 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     return mesh;
   };
 
+  var spriteCache = new Map(); // text+style → {tex, w, h}; textures are shared
+  G.clearSpriteCache = function () {
+    spriteCache.forEach(function (e) { e.tex.dispose(); });
+    spriteCache.clear();
+  };
   G.textSprite = function (text, opts) {
     opts = opts || {};
-    var fontPx = 46;
-    var font = opts.italic ? 'italic 500 ' + fontPx + 'px Georgia, serif'
-      : opts.serif ? '500 ' + fontPx + 'px Georgia, serif'
-      : '500 ' + fontPx + 'px system-ui, sans-serif';
-    var canvas = document.createElement('canvas');
-    var c2 = canvas.getContext('2d');
-    c2.font = font;
-    var w = Math.ceil(c2.measureText(text).width) + 16;
-    var h = fontPx + 18;
-    canvas.width = w; canvas.height = h;
-    c2 = canvas.getContext('2d');
-    c2.font = font;
-    c2.textBaseline = 'middle';
-    if (opts.halo !== false) {
-      c2.lineWidth = 8; c2.strokeStyle = opts.haloColor || 'rgba(255,255,255,0.9)';
-      c2.strokeText(text, 8, h / 2);
+    var key = text + '|' + (opts.italic ? 1 : 0) + (opts.serif ? 1 : 0) + '|' +
+      (opts.color || '') + '|' + (opts.haloColor || '');
+    var entry = spriteCache.get(key);
+    if (!entry) {
+      var fontPx = 46;
+      var font = opts.italic ? 'italic 500 ' + fontPx + 'px Georgia, serif'
+        : opts.serif ? '500 ' + fontPx + 'px Georgia, serif'
+        : '500 ' + fontPx + 'px system-ui, sans-serif';
+      var canvas = document.createElement('canvas');
+      var c2 = canvas.getContext('2d');
+      c2.font = font;
+      var w = Math.ceil(c2.measureText(text).width) + 16;
+      var h = fontPx + 18;
+      canvas.width = w; canvas.height = h;
+      c2 = canvas.getContext('2d');
+      c2.font = font;
+      c2.textBaseline = 'middle';
+      if (opts.halo !== false) {
+        c2.lineWidth = 8; c2.strokeStyle = opts.haloColor || 'rgba(255,255,255,0.9)';
+        c2.strokeText(text, 8, h / 2);
+      }
+      c2.fillStyle = opts.color || '#333';
+      c2.fillText(text, 8, h / 2);
+      var tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      tex._shared = true; // never disposed by scene teardown, only by clearSpriteCache
+      if (spriteCache.size > 400) G.clearSpriteCache();
+      entry = { tex: tex, w: w, h: h };
+      spriteCache.set(key, entry);
     }
-    c2.fillStyle = opts.color || '#333';
-    c2.fillText(text, 8, h / 2);
-    var tex = new THREE.CanvasTexture(canvas);
-    tex.minFilter = THREE.LinearFilter;
-    var mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    var mat = new THREE.SpriteMaterial({ map: entry.tex, depthTest: false, transparent: true });
     var sp = new THREE.Sprite(mat);
     var worldH = (opts.worldH || 0.36);
-    sp.scale.set(worldH * w / h, worldH, 1);
+    sp.scale.set(worldH * entry.w / entry.h, worldH, 1);
     sp.renderOrder = 999;
     return sp;
   };
@@ -3353,14 +3393,49 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     var posArr = new Float32Array(positions);
     var normArr = new Float32Array(positions.length);
     var eps = Math.min(hx, hy, hz) * 0.5;
+    // gradient at lattice node via central differences of the sampled field
+    var nodeGrad = function (i2, j2, k2, out2) {
+      var ia = i2 > 0 ? i2 - 1 : i2, ib = i2 < nx - 1 ? i2 + 1 : i2;
+      var ja = j2 > 0 ? j2 - 1 : j2, jb = j2 < nx - 1 ? j2 + 1 : j2;
+      var ka = k2 > 0 ? k2 - 1 : k2, kb = k2 < nx - 1 ? k2 + 1 : k2;
+      var vxa = at(ia, j2, k2), vxb = at(ib, j2, k2);
+      var vya = at(i2, ja, k2), vyb = at(i2, jb, k2);
+      var vza = at(i2, j2, ka), vzb = at(i2, j2, kb);
+      if (!isFinite(vxa) || !isFinite(vxb) || !isFinite(vya) || !isFinite(vyb) ||
+          !isFinite(vza) || !isFinite(vzb)) return false;
+      out2[0] = (vxb - vxa) / ((ib - ia) * hx);
+      out2[1] = (vyb - vya) / ((jb - ja) * hy);
+      out2[2] = (vzb - vza) / ((kb - ka) * hz);
+      return true;
+    };
+    var cg = [0, 0, 0];
     for (var vI = 0; vI < n; vI++) {
       var px = posArr[vI * 3], py = posArr[vI * 3 + 1], pz = posArr[vI * 3 + 2];
-      var gx, gy, gz;
-      try {
-        gx = F(px + eps, py, pz) - F(px - eps, py, pz);
-        gy = F(px, py + eps, pz) - F(px, py - eps, pz);
-        gz = F(px, py, pz + eps) - F(px, py, pz - eps);
-      } catch (e) { gx = gy = gz = NaN; }
+      var gx = 0, gy = 0, gz = 0;
+      // trilinear blend of the 8 surrounding lattice-node gradients (no F calls)
+      var fx2 = (px - x0) / hx, fy2 = (py - y0) / hy, fz2 = (pz - z0) / hz;
+      var i0g = Math.max(0, Math.min(nx - 2, Math.floor(fx2)));
+      var j0g = Math.max(0, Math.min(nx - 2, Math.floor(fy2)));
+      var k0g = Math.max(0, Math.min(nx - 2, Math.floor(fz2)));
+      var tx = Math.max(0, Math.min(1, fx2 - i0g));
+      var ty = Math.max(0, Math.min(1, fy2 - j0g));
+      var tz = Math.max(0, Math.min(1, fz2 - k0g));
+      var okAll = true;
+      for (var c8 = 0; c8 < 8 && okAll; c8++) {
+        var di = c8 & 1, dj = (c8 >> 1) & 1, dk = (c8 >> 2) & 1;
+        var w8 = (di ? tx : 1 - tx) * (dj ? ty : 1 - ty) * (dk ? tz : 1 - tz);
+        if (w8 === 0) continue;
+        if (!nodeGrad(i0g + di, j0g + dj, k0g + dk, cg)) { okAll = false; break; }
+        gx += w8 * cg[0]; gy += w8 * cg[1]; gz += w8 * cg[2];
+      }
+      if (!okAll) {
+        // rare: field undefined nearby; fall back to direct evaluation
+        try {
+          gx = F(px + eps, py, pz) - F(px - eps, py, pz);
+          gy = F(px, py + eps, pz) - F(px, py - eps, pz);
+          gz = F(px, py, pz + eps) - F(px, py, pz - eps);
+        } catch (e) { gx = gy = gz = NaN; }
+      }
       var gl = Math.sqrt(gx * gx + gy * gy + gz * gz);
       if (!isFinite(gl) || gl === 0) { gx = 0; gy = 0; gz = 1; gl = 1; }
       normArr[vI * 3] = gx / gl; normArr[vI * 3 + 1] = gy / gl; normArr[vI * 3 + 2] = gz / gl;
@@ -3395,6 +3470,53 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var grp = new THREE.Group(); grp.add(mesh, wf); return grp;
     }
     return mesh;
+  };
+
+  /* flat stroked line in the plane {axes[axIdx]=c0}: a thin unlit ribbon */
+  G.flatRibbon = function (polylines, axIdx, c0, win, style) {
+    // width relative to the vertical range: constant on-screen stroke in 2D
+    var w = (win.ymax - win.ymin) * 0.0028;
+    var lift = c0 + (win.ymax - win.ymin) * 0.0005; // avoid z-fighting the grid plane
+    var ia = axIdx === 0 ? 1 : 0;      // in-plane axis a
+    var ib = axIdx === 2 ? 1 : 2;      // in-plane axis b
+    var positions = [], indices = [];
+    polylines.forEach(function (poly) {
+      var n = poly.length;
+      if (n < 2) return;
+      var closed = n > 3 && Math.hypot(
+        poly[0][ia] - poly[n - 1][ia], poly[0][ib] - poly[n - 1][ib]) < win.diag * 0.01;
+      if (closed) { poly = poly.slice(0, n - 1); n = poly.length; }
+      var base = positions.length / 3;
+      for (var i = 0; i < n; i++) {
+        var ip = closed ? (i - 1 + n) % n : Math.max(0, i - 1);
+        var inx = closed ? (i + 1) % n : Math.min(n - 1, i + 1);
+        var ta = poly[inx][ia] - poly[ip][ia];
+        var tb = poly[inx][ib] - poly[ip][ib];
+        var tl = Math.hypot(ta, tb) || 1;
+        var na = -tb / tl, nb = ta / tl;
+        var pt = [0, 0, 0];
+        pt[axIdx] = lift;
+        pt[ia] = poly[i][ia] + na * w; pt[ib] = poly[i][ib] + nb * w;
+        positions.push(pt[0], pt[1], pt[2]);
+        pt[ia] = poly[i][ia] - na * w; pt[ib] = poly[i][ib] - nb * w;
+        positions.push(pt[0], pt[1], pt[2]);
+      }
+      var segCount = closed ? n : n - 1;
+      for (var s2 = 0; s2 < segCount; s2++) {
+        var a0 = base + s2 * 2, b0 = base + ((s2 + 1) % n) * 2;
+        indices.push(a0, a0 + 1, b0 + 1, a0, b0 + 1, b0);
+      }
+    });
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.setIndex(indices);
+    var op = style.opacity !== undefined ? style.opacity : 1;
+    var mat = new THREE.MeshBasicMaterial({
+      color: style.color, side: THREE.DoubleSide,
+      transparent: op < 1, opacity: op
+    });
+    mat._styleOpacity = true;
+    return new THREE.Mesh(geo, mat);
   };
 
   /* triangulated plane at freeVar = 0 (clamped into the window), for 2D traces */
@@ -3434,28 +3556,29 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     var pos = geometry.getAttribute('position');
     var idx = geometry.getIndex();
     var triCount = idx ? idx.count / 3 : pos.count / 3;
-    var vert = function (t, k) { // k-th corner of triangle t
-      var vi = idx ? idx.getX(t * 3 + k) : t * 3 + k;
-      return [pos.getX(vi), pos.getY(vi), pos.getZ(vi)];
-    };
+    // evaluate F once per unique vertex
+    var fv = new Float64Array(pos.count);
+    for (var vi = 0; vi < pos.count; vi++) {
+      var val;
+      try { val = F(pos.getX(vi), pos.getY(vi), pos.getZ(vi)); } catch (e) { val = NaN; }
+      fv[vi] = isFinite(val) ? val : NaN;
+    }
+    var vidx = function (t, k) { return idx ? idx.getX(t * 3 + k) : t * 3 + k; };
     var segs = [];
+    var ids = [0, 0, 0];
     for (var t = 0; t < triCount; t++) {
-      var p = [vert(t, 0), vert(t, 1), vert(t, 2)];
-      var f = [0, 0, 0], bad = false;
-      for (var k = 0; k < 3; k++) {
-        try { f[k] = F(p[k][0], p[k][1], p[k][2]); } catch (e) { bad = true; break; }
-        if (!isFinite(f[k])) { bad = true; break; }
-      }
-      if (bad) continue;
+      ids[0] = vidx(t, 0); ids[1] = vidx(t, 1); ids[2] = vidx(t, 2);
+      if (isNaN(fv[ids[0]]) || isNaN(fv[ids[1]]) || isNaN(fv[ids[2]])) continue;
       var cross = [];
-      for (k = 0; k < 3; k++) {
-        var k2 = (k + 1) % 3;
-        if ((f[k] < 0) !== (f[k2] < 0)) {
-          var s = f[k] / (f[k] - f[k2]);
+      for (var k = 0; k < 3; k++) {
+        var ia = ids[k], ib = ids[(k + 1) % 3];
+        var fa = fv[ia], fb = fv[ib];
+        if ((fa < 0) !== (fb < 0)) {
+          var s = fa / (fa - fb);
           cross.push([
-            p[k][0] + (p[k2][0] - p[k][0]) * s,
-            p[k][1] + (p[k2][1] - p[k][1]) * s,
-            p[k][2] + (p[k2][2] - p[k][2]) * s]);
+            pos.getX(ia) + (pos.getX(ib) - pos.getX(ia)) * s,
+            pos.getY(ia) + (pos.getY(ib) - pos.getY(ia)) * s,
+            pos.getZ(ia) + (pos.getZ(ib) - pos.getZ(ia)) * s]);
         }
       }
       if (cross.length === 2) segs.push([cross[0], cross[1]]);
@@ -3500,6 +3623,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       polylines.push(line);
     }
 
+    if (style.flatAxis !== undefined) {
+      return G.flatRibbon(polylines, style.flatAxis, style.flatC0 || 0, win, style);
+    }
     var mat = solidMaterial(style, 50);
     polylines.forEach(function (line) {
       if (line.length < 2) return;
@@ -3574,9 +3700,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
   P.Viewport = function (container) {
     var self = this;
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
-    this.renderer.setClearColor(0x000000, 0); // CSS gradient shows through
+    this.renderer.setClearColor(P.THEMES.light.fog, 1); // opaque: no compositor blend
     container.appendChild(this.renderer.domElement);
 
     this.theme = P.THEMES.light;
@@ -3584,6 +3710,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.01, 4000);
     this.camera.up.set(0, 0, 1);
 
+    this.camera2d = new THREE.OrthographicCamera(-1, 1, 1, -1, -1000, 1000);
+    this.camera2d.up.set(0, 1, 0);
     this._hemi = new THREE.HemisphereLight(0xffffff, 0x556677, 0.85);
     this.scene.add(this._hemi);
     this._dl1 = new THREE.DirectionalLight(0xffffff, 0.65);
@@ -3603,12 +3731,33 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.rotateSpeed = 0.75;
+    this._needsRender = true;
+    this.controls.addEventListener('change', function () { self._needsRender = true; });
     // the wheel zooms the WINDOW (axis ranges), not the camera; see onWheelZoom
     this.controls.enableZoom = false;
     this.renderer.domElement.addEventListener('wheel', function (ev) {
       ev.preventDefault();
       if (self.onWheelZoom) self.onWheelZoom(Math.exp(ev.deltaY * 0.0012));
     }, { passive: false });
+    var panLast = null;
+    this.renderer.domElement.addEventListener('pointerdown', function (ev) {
+      if (self.mode2d && ev.button === 0) {
+        panLast = [ev.clientX, ev.clientY];
+        self.renderer.domElement.setPointerCapture(ev.pointerId);
+      }
+    });
+    this.renderer.domElement.addEventListener('pointermove', function (ev) {
+      if (self.mode2d && panLast && self.onPan2d) {
+        var wEl = self.renderer.domElement.clientWidth, hEl = self.renderer.domElement.clientHeight;
+        var dx = (ev.clientX - panLast[0]) / wEl * (self.win.xmax - self.win.xmin);
+        var dy = (ev.clientY - panLast[1]) / hEl * (self.win.ymax - self.win.ymin);
+        panLast = [ev.clientX, ev.clientY];
+        self.onPan2d(-dx, dy);
+      }
+    });
+    ['pointerup', 'pointercancel'].forEach(function (evn) {
+      self.renderer.domElement.addEventListener(evn, function () { panLast = null; });
+    });
 
     this.showAxes = true; this.showGrid = true; this.showBox = true;
 
@@ -3618,14 +3767,17 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       self.renderer.setSize(w, h);
       self.camera.aspect = w / h;
       self.camera.updateProjectionMatrix();
+      if (self.mode2d && self.onResize2d) self.onResize2d();
+      self._needsRender = true;
     };
     window.addEventListener('resize', this.resize);
     if (window.ResizeObserver) new ResizeObserver(this.resize).observe(container);
 
     var loop = function () {
       requestAnimationFrame(loop);
-      self.controls.update();
+      var moved = self.controls.update();
       if (self._pops.length) {
+        self._needsRender = true;
         var now = performance.now();
         for (var pi = self._pops.length - 1; pi >= 0; pi--) {
           var pp = self._pops[pi];
@@ -3642,21 +3794,50 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           pp.obj.position.set(self.center.x * (1 - sc), self.center.y * (1 - sc), self.center.z * (1 - sc));
         }
       }
-      self.renderer.render(self.scene, self.camera);
+      if (moved || self._needsRender) {
+        self.renderer.render(self.scene, self.mode2d ? self.camera2d : self.camera);
+        self._needsRender = false;
+      }
     };
     this.resize();
     loop();
   };
 
   P.Viewport.prototype = {
+    requestRender: function () { this._needsRender = true; },
+
+    setMode2d: function (on) {
+      this.mode2d = on;
+      this.controls.enabled = !on;
+      if (this.win) {
+        if (on) this.update2dCamera();
+        else { this.camera.up.set(0, 0, 1); this.home(); }
+        this.rebuildDecor();
+      }
+      this._needsRender = true;
+    },
+
+    // the ortho frustum IS the window: world units map 1:1 onto the screen
+    update2dCamera: function () {
+      var w = this.win, c = this.camera2d;
+      c.left = w.xmin; c.right = w.xmax; c.top = w.ymax; c.bottom = w.ymin;
+      c.position.set((w.xmin + w.xmax) / 2, (w.ymin + w.ymax) / 2, 100);
+      c.lookAt((w.xmin + w.xmax) / 2, (w.ymin + w.ymax) / 2, 0);
+      c.updateProjectionMatrix();
+      this._needsRender = true;
+    },
+
     setTheme: function (name) {
       var T = this.theme = P.THEMES[name] || P.THEMES.light;
+      P.geom.clearSpriteCache();
+      this.renderer.setClearColor(T.fog, 1);
       this._hemi.color.setHex(T.hemiSky);
       this._hemi.groundColor.setHex(T.hemiGround);
       this._hemi.intensity = T.hemiInt;
       this._dl1.intensity = T.dl1;
       this._dl2.intensity = T.dl2;
       if (this.win) this.rebuildDecor();
+      this._needsRender = true;
     },
 
     setWindow: function (win) {
@@ -3664,10 +3845,13 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var cx = (win.xmin + win.xmax) / 2, cy = (win.ymin + win.ymax) / 2, cz = (win.zmin + win.zmax) / 2;
       this.center = new THREE.Vector3(cx, cy, cz);
       this.controls.target.copy(this.center);
+      if (this.mode2d) this.update2dCamera();
       this.rebuildDecor();
     },
 
     home: function () {
+      if (this.mode2d) { this.update2dCamera(); return; }
+      this._needsRender = true;
       var d = this.win.diag;
       this.camera.position.set(
         this.center.x + d * 0.85,
@@ -3681,6 +3865,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var v = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
       v.multiplyScalar(f);
       this.camera.position.copy(this.controls.target).add(v);
+      this._needsRender = true;
     },
 
     // scale camera distance about the target so window rescaling keeps the framing
@@ -3696,10 +3881,12 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var s = this._decorScale, c = this.center;
       this.decor.scale.setScalar(s);
       this.decor.position.set(c.x * (1 - s), c.y * (1 - s), c.z * (1 - s));
+      this._needsRender = true;
     },
 
     rebuildDecor: function () {
       var win = this.win, self = this;
+      this._needsRender = true;
       this._decorScale = 1;
       this.decor.scale.setScalar(1);
       this.decor.position.set(0, 0, 0);
@@ -3708,7 +3895,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         dc.traverse(function (o) {
           if (o.geometry) o.geometry.dispose();
           if (o.material) {
-            if (o.material.map) o.material.map.dispose();
+            if (o.material.map && !o.material.map._shared) o.material.map.dispose();
             o.material.dispose();
           }
         });
@@ -3716,13 +3903,18 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       }
       var d = win.diag;
       var T = this.theme;
-      this.scene.fog = new THREE.Fog(T.fog, d * 1.6, d * 4.5);
+      this.scene.fog = this.mode2d ? null : new THREE.Fog(T.fog, d * 1.6, d * 4.5);
 
       function line(pts, color, opacity) {
         var geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
         var mat = new THREE.LineBasicMaterial({ color: color, transparent: opacity < 1, opacity: opacity });
         return new THREE.LineSegments(geo, mat);
+      }
+
+      if (this.mode2d) {
+        this.build2dDecor(line);
+        return;
       }
 
       if (this.showGrid) {
@@ -3742,7 +3934,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         if (win.zmin <= 0 && win.zmax >= 0) this.decor.add(line(pts, T.grid, 1));
       }
 
-      if (this.showBox) {
+      if (this.showBox && !this.mode2d) {
         var bg = new THREE.BoxGeometry(win.xmax - win.xmin, win.ymax - win.ymin, win.zmax - win.zmin);
         var edges = new THREE.LineSegments(new THREE.EdgesGeometry(bg),
           new THREE.LineBasicMaterial({ color: T.box }));
@@ -3756,6 +3948,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           { dir: [0, 1, 0], min: win.ymin, max: win.ymax, label: 'y', tickDir: [1, 0, 0] },
           { dir: [0, 0, 1], min: win.zmin, max: win.zmax, label: 'z', tickDir: [1, 0, 0] }
         ];
+        if (this.mode2d) axInfo = axInfo.slice(0, 2);
         var tickLen = d * 0.008;
         axInfo.forEach(function (ax) {
           if (ax.min > 0 || ax.max < 0) return; // axis line only if it passes through window
@@ -3794,6 +3987,48 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       }
     },
 
+    // flat Desmos-style plane: minor + major grid, axes, numbers at majors
+    build2dDecor: function (line) {
+      var win = this.win, T = this.theme, self = this;
+      var xr = win.xmax - win.xmin, yr = win.ymax - win.ymin;
+      var step = niceStep(yr);
+      var minor = step / 5;
+      var minorPts = [], majorPts = [];
+      var g0;
+      if (this.showGrid) {
+        for (g0 = Math.ceil(win.xmin / minor) * minor; g0 <= win.xmax + 1e-9; g0 += minor) {
+          var isMaj = Math.abs(g0 / step - Math.round(g0 / step)) < 1e-6;
+          (isMaj ? majorPts : minorPts).push(g0, win.ymin, 0, g0, win.ymax, 0);
+        }
+        for (g0 = Math.ceil(win.ymin / minor) * minor; g0 <= win.ymax + 1e-9; g0 += minor) {
+          var isMaj2 = Math.abs(g0 / step - Math.round(g0 / step)) < 1e-6;
+          (isMaj2 ? majorPts : minorPts).push(win.xmin, g0, 0, win.xmax, g0, 0);
+        }
+        this.decor.add(line(minorPts, T.grid, 0.45));
+        this.decor.add(line(majorPts, T.grid, 1));
+      }
+      if (!this.showAxes) return;
+      // axis lines
+      if (win.ymin <= 0 && win.ymax >= 0) this.decor.add(line([win.xmin, 0, 0, win.xmax, 0, 0], T.axis, 1));
+      if (win.xmin <= 0 && win.xmax >= 0) this.decor.add(line([0, win.ymin, 0, 0, win.ymax, 0], T.axis, 1));
+      // numbers at majors, pinned near the axes
+      var wh = yr * 0.023;
+      var ay = Math.max(win.ymin + yr * 0.03, Math.min(win.ymax - yr * 0.03, 0)); // x-label baseline
+      var ax = Math.max(win.xmin + xr * 0.02, Math.min(win.xmax - xr * 0.02, 0)); // y-label baseline
+      for (g0 = Math.ceil(win.xmin / step) * step; g0 <= win.xmax + 1e-9; g0 += step) {
+        if (Math.abs(g0) < step / 2) continue;
+        var nx = P.geom.textSprite(fmtTick(g0), { color: T.tick, worldH: wh, serif: true, haloColor: T.halo });
+        nx.position.set(g0, ay - yr * 0.022, 0.01);
+        this.decor.add(nx);
+      }
+      for (g0 = Math.ceil(win.ymin / step) * step; g0 <= win.ymax + 1e-9; g0 += step) {
+        if (Math.abs(g0) < step / 2) continue;
+        var ny = P.geom.textSprite(fmtTick(g0), { color: T.tick, worldH: wh, serif: true, haloColor: T.halo });
+        ny.position.set(ax - xr * 0.016, g0, 0.01);
+        this.decor.add(ny);
+      }
+    },
+
     setObject: function (id, obj) {
       var isNew = !this.objects[id];
       this.removeObject(id);
@@ -3802,16 +4037,18 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         this.plots.add(obj);
         if (isNew && !P.reducedMotion) this._pops.push({ obj: obj, t0: performance.now() });
       }
+      this._needsRender = true;
     },
     removeObject: function (id) {
       var old = this.objects[id];
+      this._needsRender = true;
       if (old) {
         this.plots.remove(old);
         old.traverse(function (o) {
           if (o.isInstancedMesh) o.dispose(); // frees instanceMatrix GL buffers
           if (o.geometry) o.geometry.dispose();
           if (o.material) {
-            if (o.material.map) o.material.map.dispose();
+            if (o.material.map && !o.material.map._shared) o.material.map.dispose();
             o.material.dispose();
           }
         });
@@ -3820,10 +4057,12 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     },
     setVisible: function (id, on) {
       if (this.objects[id]) this.objects[id].visible = on;
+      this._needsRender = true;
     },
 
     /* focus dimming: focused row's object full strength, others faded */
     focus: function (id) {
+      this._needsRender = true;
       var objs = this.objects;
       Object.keys(objs).forEach(function (key) {
         objs[key].traverse(function (o) {
@@ -3843,6 +4082,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       });
     },
     unfocus: function () {
+      this._needsRender = true;
       Object.keys(this.objects).forEach(function (key) {
         this.objects[key].traverse(function (o) {
           if (!o.material || o.material._baseOpacity === undefined) return;
@@ -4385,9 +4625,16 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     this._playing = new Set();
 
     var saved = this.load();
+    this.mode2d = !!(saved && saved.view && saved.view.mode2d);
     this.themeName = (saved && saved.view && saved.view.theme === 'dark') ? 'dark' : 'light';
     this.applyTheme(this.themeName, true);
     this.viewport.onWheelZoom = function (f) { self.wheelZoom(f); };
+    this.viewport.onPan2d = function (dx, dy) { self.pan2d(dx, dy); };
+    this.viewport.onResize2d = function () {
+      clearTimeout(self._aspectTimer);
+      self._aspectTimer = setTimeout(function () { if (self.mode2d) self.applyAspect2d(); }, 250);
+    };
+    if (this.mode2d) this.viewport.setMode2d(true);
     this.setWindow(saved && saved.window ? saved.window : { xmin: -4, xmax: 4, ymin: -4, ymax: 4, zmin: -4, zmax: 4 }, true);
     if (saved && saved.view) {
       this.viewport.showAxes = saved.view.axes !== false;
@@ -4445,6 +4692,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           entry.row.state.latex = entry.row.mf.latex();
         }
       });
+      self.interactFast();
       self.refreshDerived();
       self.buildAllGeom();
       self.updateValues();
@@ -4519,6 +4767,18 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       if (!skipSave) this.saveSoon();
     },
 
+    // during continuous interaction (slider drag / play), rebuild coarse and
+    // sharpen shortly after the interaction pauses
+    interactFast: function () {
+      var self = this;
+      this._fastMode = true;
+      clearTimeout(this._sharpenTimer);
+      this._sharpenTimer = setTimeout(function () {
+        self._fastMode = false;
+        self.buildAllGeom();
+      }, 260);
+    },
+
     /* live opacity: mutate materials, no re-tessellation */
     applyOpacityLive: function (row, v) {
       row.state.opacity = v;
@@ -4535,6 +4795,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           o.material._baseTransparent = vv < 1;
         }
       });
+      this.viewport.requestRender();
     },
     addSliderRowFor: function (row, name) {
       var r = new P.Row(this, { latex: nameLatex(name) + '=1' });
@@ -4629,8 +4890,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         var isTuple = cand.rhs.t === 'tuple' ||
           (cand.rhs.t === 'apply' && env.funcs[cand.rhs.head] && env.funcs[cand.rhs.head].isTuple) ||
           (cand.rhs.t === 'var' && Array.isArray(env.constVals[cand.rhs.name]));
-        env.constVals[name] = isTuple ? P.evalTupleConst(cand.rhs, env) : P.evalConst(cand.rhs, env);
-        self.constOrder.push({ name: name, rhs: cand.rhs, isTuple: isTuple, row: cand.row });
+        var cfn = isTuple ? P.makeTupleConstFn(cand.rhs, env) : P.makeFn(cand.rhs, [], env);
+        env.constVals[name] = cfn();
+        self.constOrder.push({ name: name, rhs: cand.rhs, isTuple: isTuple, row: cand.row, fn: cfn });
         state[name] = 'done';
       };
       Object.keys(candidates).forEach(function (name) {
@@ -4649,7 +4911,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         var st = entry.row.stmt;
         if (st.kind === 'rel' && st.rhs === entry.rhs && (st.rhs.t === 'num' || (st.rhs.t === 'neg' && st.rhs.a.t === 'num'))) return; // slider: value set by drag
         try {
-          env.constVals[entry.name] = entry.isTuple ? P.evalTupleConst(entry.rhs, env) : P.evalConst(entry.rhs, env);
+          env.constVals[entry.name] = entry.fn();
         } catch (e) { env.constVals[entry.name] = NaN; }
       });
     },
@@ -4996,7 +5258,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       });
       // note: opacity is intentionally NOT in the key — it is applied live to materials
       return JSON.stringify([s.latex, spec.type, w, s.color, s.mesh, s.res, s.density, s.label,
-        s.domains, domVals, deps, this.viewport.showBox, s.flat2d ? '2d' : '3d',
+        s.domains, domVals, deps, this.viewport.showBox, (s.flat2d || this.mode2d) ? '2d' : '3d',
         this._fastMode ? 'fast' : 'full']);
     },
 
@@ -5036,15 +5298,17 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var res = s.res || 64;
       if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
 
-      // "show in 2D": slice the row's own rendered mesh with the free
-      // variable's zero plane, so domain-edge refinement (asymptotes)
-      // carries over into the flat curve
-      if (s.flat2d) {
+      // "show in 2D" (or global 2D mode): slice the row's own rendered mesh
+      // with the free variable's zero plane, so domain-edge refinement
+      // (asymptotes) carries over into the flat curve
+      if (s.flat2d || this.mode2d) {
         var fv = this.flat2dInfo(row);
         if (fv) {
-          s.flat2d = false;
+          var hadFlat = s.flat2d, hadMode = this.mode2d;
+          s.flat2d = false; this.mode2d = false;
           var obj3d = null;
-          try { obj3d = this.buildObject(row, spec); } finally { s.flat2d = true; }
+          try { obj3d = this.buildObject(row, spec); }
+          finally { s.flat2d = hadFlat; this.mode2d = hadMode; }
           var meshGeo = null;
           if (obj3d) {
             obj3d.traverse(function (o) {
@@ -5055,8 +5319,11 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
             var lim = { x: [win.xmin, win.xmax], y: [win.ymin, win.ymax], z: [win.zmin, win.zmax] }[fv];
             var c0 = Math.max(lim[0], Math.min(lim[1], 0));
             var ci = { x: 0, y: 1, z: 2 }[fv];
-            var Fc = function (x, y, z) { return [x, y, z][ci] - c0; };
-            var curve = G.intersectionCurve(Fc, meshGeo, win, style);
+            var Fc = ci === 0 ? function (x) { return x - c0; }
+              : ci === 1 ? function (x, y) { return y - c0; }
+              : function (x, y, z) { return z - c0; };
+            var flatStyle = { color: style.color, opacity: style.opacity, flatAxis: ci, flatC0: c0 };
+            var curve = G.intersectionCurve(Fc, meshGeo, win, flatStyle);
             obj3d.traverse(function (o) {
               if (o.geometry) o.geometry.dispose();
               if (o.material) {
@@ -5094,7 +5361,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         }
         case 'curve': {
           var td = row.getDomain('t', 0, 2 * Math.PI);
-          return G.curve(P.makeTupleFn(spec.expr, ['t'], env), td[0], td[1], win, style);
+          return G.curve(P.makeTupleFn(spec.expr, ['t'], env), td[0], td[1], win, style,
+            this._fastMode ? 100 : 0, this.mode2d);
         }
         case 'psurf': {
           var ud = row.getDomain('u', 0, 2 * Math.PI), vd = row.getDomain('v', 0, 2 * Math.PI);
@@ -5153,8 +5421,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       if (!this._dragRAF) {
         this._dragRAF = requestAnimationFrame(function () {
           self._dragRAF = null;
+          self.interactFast();
           self.refreshDerived();
-          self.rows.forEach(function (r) { self.buildGeomIfDirty(r); });
+          self.buildAllGeom();
           self.updateValues();
         });
       }
@@ -5187,13 +5456,48 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var span = (w.xmax - w.xmin) * f;
       if (span < 1e-3 || span > 1e5) return;
       var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2, cz = (w.zmin + w.zmax) / 2;
-      this.viewport.scaleView(f);
+      var flat = this.mode2d;
+      if (!flat) this.viewport.scaleView(f);
       this.setWindow({
         xmin: cx + (w.xmin - cx) * f, xmax: cx + (w.xmax - cx) * f,
         ymin: cy + (w.ymin - cy) * f, ymax: cy + (w.ymax - cy) * f,
-        zmin: cz + (w.zmin - cz) * f, zmax: cz + (w.zmax - cz) * f
+        zmin: flat ? w.zmin : cz + (w.zmin - cz) * f,
+        zmax: flat ? w.zmax : cz + (w.zmax - cz) * f
       });
       this.flashWindowSize();
+    },
+
+    // drag-pan in 2D: window slides under the cursor, coarse rebuilds follow
+    pan2d: function (dx, dy) {
+      var w = this.win;
+      w.xmin += dx; w.xmax += dx; w.ymin += dy; w.ymax += dy;
+      this.viewport.win = w;
+      this.viewport.update2dCamera();
+      var self = this;
+      if (!this._panRAF) {
+        this._panRAF = requestAnimationFrame(function () {
+          self._panRAF = null;
+          self._fastMode = true;
+          self.buildAllGeom();
+        });
+      }
+      clearTimeout(this._panTimer);
+      this._panTimer = setTimeout(function () {
+        self._panTimer = null;
+        self._fastMode = false;
+        self.setWindow(self.win);
+      }, 220);
+    },
+
+    // in 2D the window must match the viewport shape so the grid is edge-to-edge
+    applyAspect2d: function () {
+      var elc = this.viewport.renderer.domElement;
+      var aspect = elc.clientWidth / Math.max(1, elc.clientHeight);
+      var w = this.win;
+      var yr = w.ymax - w.ymin, xc = (w.xmin + w.xmax) / 2, xr = yr * aspect;
+      w.xmin = xc - xr / 2;
+      w.xmax = xc + xr / 2;
+      this.setWindow(w);
     },
 
     // Gesture-speed window step: geometry only, at coarse resolution.
@@ -5203,16 +5507,22 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var span = (w.xmax - w.xmin) * f;
       if (span < 1e-3 || span > 1e5) return;
       var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2, cz = (w.zmin + w.zmax) / 2;
+      var flat = this.mode2d;
       var nw = {
         xmin: cx + (w.xmin - cx) * f, xmax: cx + (w.xmax - cx) * f,
         ymin: cy + (w.ymin - cy) * f, ymax: cy + (w.ymax - cy) * f,
-        zmin: cz + (w.zmin - cz) * f, zmax: cz + (w.zmax - cz) * f
+        zmin: flat ? w.zmin : cz + (w.zmin - cz) * f,
+        zmax: flat ? w.zmax : cz + (w.zmax - cz) * f
       };
       nw.diag = Math.hypot(nw.xmax - nw.xmin, nw.ymax - nw.ymin, nw.zmax - nw.zmin);
       this.win = nw;
       this.viewport.win = nw;
-      this.viewport.scaleView(f);
-      this.viewport.scaleDecor(f);
+      if (flat) {
+        this.viewport.update2dCamera();
+      } else {
+        this.viewport.scaleView(f);
+        this.viewport.scaleDecor(f);
+      }
       this.buildAllGeom();
       this.flashWindowSize();
     },
@@ -5275,6 +5585,20 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       });
       document.getElementById('themebtn').addEventListener('click', function () {
         self.applyTheme(self.themeName === 'dark' ? 'light' : 'dark');
+      });
+      var dim = document.getElementById('dimbtn');
+      var syncDim = function () {
+        dim.textContent = self.mode2d ? '3D' : '2D';
+        dim.title = self.mode2d ? 'back to the 3D view' : 'flat top-down 2D view';
+      };
+      syncDim();
+      dim.addEventListener('click', function () {
+        self.mode2d = !self.mode2d;
+        self.viewport.setMode2d(self.mode2d);
+        syncDim();
+        if (self.mode2d) self.applyAspect2d(); // triggers recompute via setWindow
+        else self.recompute();
+        self.saveSoon();
       });
       var zi = document.getElementById('zoomin'), zo = document.getElementById('zoomout');
       zi.title = 'zoom the window in';
@@ -5421,16 +5745,28 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var hp = document.getElementById('docsbody');
       var section = function (title) {
         el('div', 'docsec', hp).textContent = title;
-        return el('div', 'doctext', hp);
+      };
+      var refs = function (pairs) {
+        var box = el('div', 'reflist', hp);
+        pairs.forEach(function (pr) {
+          var row = el('div', 'refrow', box);
+          el('span', 'refk', row).innerHTML = pr[0];
+          el('span', 'refv', row).innerHTML = pr[1];
+        });
       };
 
-      section('Typing math').innerHTML =
-        'Type <b>rho</b>, <b>theta</b>, <b>phi</b>, <b>pi</b>, or <b>tau</b> and it turns into ρ, θ, φ, π, τ. ' +
-        'Press <b>/</b> for a fraction and <b>^</b> for an exponent. <b>sqrt</b> gives a square root, <b>nthroot</b> any other root, <b>|</b> absolute value bars. ' +
-        'Functions like sin, cos, and ln work as written. For log base 2, type <b>log</b> then <b>_2</b>. ' +
-        '<b>Enter</b> adds a row. The arrow keys move between rows. Backspace on an empty row deletes it.';
+      section('Typing');
+      refs([
+        ['<b>rho theta phi pi</b>', '\u03c1 \u03b8 \u03c6 \u03c0'],
+        ['<b>/</b> and <b>^</b>', 'fraction, exponent'],
+        ['<b>sqrt</b>, <b>nthroot</b>', 'roots'],
+        ['<b>log</b> then <b>_2</b>', 'log base 2'],
+        ['<b>Enter</b>', 'new row'],
+        ['<b>\u2191 \u2193</b>', 'move between rows'],
+        ['<b>\u232b</b> on an empty row', 'delete it']
+      ]);
 
-      el('div', 'docsec', hp).textContent = 'Everything you can plot (click to insert)';
+      section('Plot anything (click to insert)');
       var EXAMPLES = [
         ['cylinder', 'r=1'],
         ['half-plane', '\\theta =\\frac{\\pi }{4}'],
@@ -5478,36 +5814,48 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           self.saveSoon();
         });
       });
-      section('Coordinates & conventions').innerHTML =
-        'The z axis points up. Cylindrical coordinates are <b>r</b>, <b>θ</b>, <b>z</b>, with θ = atan2(y, x). ' +
-        'Spherical coordinates are <b>ρ</b>, <b>φ</b>, <b>θ</b>, where φ is measured down from the +z axis (0 ≤ φ ≤ π). ' +
-        'An equation that is not solved for a single variable is drawn as an implicit surface. This works in any coordinate system. ' +
-        'Curves use the parameter <b>t</b>. Parametric surfaces use <b>u</b> and <b>v</b>. ' +
-        'Their ranges are editable under the row and accept values like <b>2pi</b> or a slider name. ' +
-        'Tuples with 2 components are drawn in the xy plane: <b>(1, 2)</b> is a point at z = 0, ' +
-        '<b>(cos(t), sin(t))</b> is a flat circle, and <b>G(x,y) = (-y, x)</b> is a 2D vector field.';
+      section('Coordinates');
+      refs([
+        ['z axis', 'points up'],
+        ['\u03b8', 'atan2(y, x)'],
+        ['\u03c6', 'angle from the +z axis'],
+        ['curves', 'parameter <b>t</b>'],
+        ['parametric surfaces', '<b>u</b> and <b>v</b>'],
+        ['2-part tuples', 'drawn in the xy plane'],
+        ['unsolved equations', 'implicit surfaces, any coords']
+      ]);
 
-      section('Sliders & definitions').innerHTML =
-        'Set a free letter equal to a number, like <b>a = 1</b>, and it becomes a slider with min, max, and step. Press ▶ to animate it. ' +
-        'If you use a letter that is not defined yet, the row offers to <b>add a slider</b> for it. ' +
-        'You can also define functions like <b>f(x,y) = …</b>, constants like <b>c = 2a</b>, and named points like <b>P = (1,2,3)</b>, then use them in any other row. Order does not matter.';
+      section('Sliders and names');
+      refs([
+        ['<b>a = 1</b>', 'slider, \u25b6 animates'],
+        ['unknown letter', 'one-click add slider'],
+        ['<b>f(x,y) = \u2026</b>', 'function, usable anywhere'],
+        ['<b>c = 2a</b>, <b>P = (1,2,3)</b>', 'constant, named point']
+      ]);
 
-      section('Curves of intersection').innerHTML =
-        'Type <b>intersection</b> in a row. Two pickers appear, preset to the nearest two surfaces above it. ' +
-        'The curve is drawn as a tube with its own color and hide toggle, and it updates when either surface changes. ' +
-        'Hide both surfaces to study the curve alone. ' +
-        'One of the two surfaces needs an equation form. Two purely parametric surfaces cannot be paired yet.';
+      section('Intersections');
+      refs([
+        ['type <b>intersection</b>', 'two surface pickers appear'],
+        ['hide both surfaces', 'study the curve alone'],
+        ['limit', 'one of the pair needs an equation form']
+      ]);
 
-      section('Window & view').innerHTML =
-        'Scroll, or use the <b>+</b> and <b>−</b> buttons, to zoom the window. The axis ranges scale, for example ±4 to ±8 to ±16, and every plot is redrawn over the new region. A small note shows the new size. ' +
-        'Drag to orbit, right-drag to pan, and press ⌂ to reset the view. ' +
-        'The ⚙ panel sets exact ranges, including asymmetric ones, and toggles the axes, grid, and box.';
+      section('View');
+      refs([
+        ['<b>2D</b>', 'flat top-down view for polar and xy graphs'],
+        ['scroll or <b>+ \u2212</b>', 'zoom the window, axes rescale'],
+        ['drag, right-drag', 'orbit, pan'],
+        ['<b>\u2302</b>', 'reset the view'],
+        ['<b>\u2699</b>', 'exact ranges, axes, grid, box']
+      ]);
 
-      section('Row controls').innerHTML =
-        'Click the colored circle to show or hide a plot. Right-click it, or long-press on touch, for color and opacity. ' +
-        'The gear that appears when you hover a row has detail, mesh lines, vector field density, and point labels. ' +
-        'Surfaces that do not use one of x, y, z, like <b>y = x</b> where z is free, also get a <b>show in 2D</b> checkbox there: it draws the flat curve in the free variable\u2019s zero plane instead of the extruded sheet. ' +
-        'Clicking a row highlights its object in the 3D view. Your work autosaves in this browser.';
+      section('Rows');
+      refs([
+        ['click the circle', 'show or hide the plot'],
+        ['right-click the circle', 'color and opacity'],
+        ['gear', 'detail, mesh, labels, show in 2D'],
+        ['everything', 'autosaves in this browser']
+      ]);
     },
 
     /* ---------------- persistence ---------------- */
@@ -5520,7 +5868,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       try {
         var state = {
           window: { xmin: this.win.xmin, xmax: this.win.xmax, ymin: this.win.ymin, ymax: this.win.ymax, zmin: this.win.zmin, zmax: this.win.zmax },
-          view: { axes: this.viewport.showAxes, grid: this.viewport.showGrid, box: this.viewport.showBox, theme: this.themeName },
+          view: { axes: this.viewport.showAxes, grid: this.viewport.showGrid, box: this.viewport.showBox, theme: this.themeName, mode2d: this.mode2d },
           rows: this.rows.map(function (r) { return r.serialize(); })
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));

@@ -52,9 +52,16 @@
     this._playing = new Set();
 
     var saved = this.load();
+    this.mode2d = !!(saved && saved.view && saved.view.mode2d);
     this.themeName = (saved && saved.view && saved.view.theme === 'dark') ? 'dark' : 'light';
     this.applyTheme(this.themeName, true);
     this.viewport.onWheelZoom = function (f) { self.wheelZoom(f); };
+    this.viewport.onPan2d = function (dx, dy) { self.pan2d(dx, dy); };
+    this.viewport.onResize2d = function () {
+      clearTimeout(self._aspectTimer);
+      self._aspectTimer = setTimeout(function () { if (self.mode2d) self.applyAspect2d(); }, 250);
+    };
+    if (this.mode2d) this.viewport.setMode2d(true);
     this.setWindow(saved && saved.window ? saved.window : { xmin: -4, xmax: 4, ymin: -4, ymax: 4, zmin: -4, zmax: 4 }, true);
     if (saved && saved.view) {
       this.viewport.showAxes = saved.view.axes !== false;
@@ -112,6 +119,7 @@
           entry.row.state.latex = entry.row.mf.latex();
         }
       });
+      self.interactFast();
       self.refreshDerived();
       self.buildAllGeom();
       self.updateValues();
@@ -186,6 +194,18 @@
       if (!skipSave) this.saveSoon();
     },
 
+    // during continuous interaction (slider drag / play), rebuild coarse and
+    // sharpen shortly after the interaction pauses
+    interactFast: function () {
+      var self = this;
+      this._fastMode = true;
+      clearTimeout(this._sharpenTimer);
+      this._sharpenTimer = setTimeout(function () {
+        self._fastMode = false;
+        self.buildAllGeom();
+      }, 260);
+    },
+
     /* live opacity: mutate materials, no re-tessellation */
     applyOpacityLive: function (row, v) {
       row.state.opacity = v;
@@ -202,6 +222,7 @@
           o.material._baseTransparent = vv < 1;
         }
       });
+      this.viewport.requestRender();
     },
     addSliderRowFor: function (row, name) {
       var r = new P.Row(this, { latex: nameLatex(name) + '=1' });
@@ -296,8 +317,9 @@
         var isTuple = cand.rhs.t === 'tuple' ||
           (cand.rhs.t === 'apply' && env.funcs[cand.rhs.head] && env.funcs[cand.rhs.head].isTuple) ||
           (cand.rhs.t === 'var' && Array.isArray(env.constVals[cand.rhs.name]));
-        env.constVals[name] = isTuple ? P.evalTupleConst(cand.rhs, env) : P.evalConst(cand.rhs, env);
-        self.constOrder.push({ name: name, rhs: cand.rhs, isTuple: isTuple, row: cand.row });
+        var cfn = isTuple ? P.makeTupleConstFn(cand.rhs, env) : P.makeFn(cand.rhs, [], env);
+        env.constVals[name] = cfn();
+        self.constOrder.push({ name: name, rhs: cand.rhs, isTuple: isTuple, row: cand.row, fn: cfn });
         state[name] = 'done';
       };
       Object.keys(candidates).forEach(function (name) {
@@ -316,7 +338,7 @@
         var st = entry.row.stmt;
         if (st.kind === 'rel' && st.rhs === entry.rhs && (st.rhs.t === 'num' || (st.rhs.t === 'neg' && st.rhs.a.t === 'num'))) return; // slider: value set by drag
         try {
-          env.constVals[entry.name] = entry.isTuple ? P.evalTupleConst(entry.rhs, env) : P.evalConst(entry.rhs, env);
+          env.constVals[entry.name] = entry.fn();
         } catch (e) { env.constVals[entry.name] = NaN; }
       });
     },
@@ -663,7 +685,7 @@
       });
       // note: opacity is intentionally NOT in the key — it is applied live to materials
       return JSON.stringify([s.latex, spec.type, w, s.color, s.mesh, s.res, s.density, s.label,
-        s.domains, domVals, deps, this.viewport.showBox, s.flat2d ? '2d' : '3d',
+        s.domains, domVals, deps, this.viewport.showBox, (s.flat2d || this.mode2d) ? '2d' : '3d',
         this._fastMode ? 'fast' : 'full']);
     },
 
@@ -703,15 +725,17 @@
       var res = s.res || 64;
       if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
 
-      // "show in 2D": slice the row's own rendered mesh with the free
-      // variable's zero plane, so domain-edge refinement (asymptotes)
-      // carries over into the flat curve
-      if (s.flat2d) {
+      // "show in 2D" (or global 2D mode): slice the row's own rendered mesh
+      // with the free variable's zero plane, so domain-edge refinement
+      // (asymptotes) carries over into the flat curve
+      if (s.flat2d || this.mode2d) {
         var fv = this.flat2dInfo(row);
         if (fv) {
-          s.flat2d = false;
+          var hadFlat = s.flat2d, hadMode = this.mode2d;
+          s.flat2d = false; this.mode2d = false;
           var obj3d = null;
-          try { obj3d = this.buildObject(row, spec); } finally { s.flat2d = true; }
+          try { obj3d = this.buildObject(row, spec); }
+          finally { s.flat2d = hadFlat; this.mode2d = hadMode; }
           var meshGeo = null;
           if (obj3d) {
             obj3d.traverse(function (o) {
@@ -722,8 +746,11 @@
             var lim = { x: [win.xmin, win.xmax], y: [win.ymin, win.ymax], z: [win.zmin, win.zmax] }[fv];
             var c0 = Math.max(lim[0], Math.min(lim[1], 0));
             var ci = { x: 0, y: 1, z: 2 }[fv];
-            var Fc = function (x, y, z) { return [x, y, z][ci] - c0; };
-            var curve = G.intersectionCurve(Fc, meshGeo, win, style);
+            var Fc = ci === 0 ? function (x) { return x - c0; }
+              : ci === 1 ? function (x, y) { return y - c0; }
+              : function (x, y, z) { return z - c0; };
+            var flatStyle = { color: style.color, opacity: style.opacity, flatAxis: ci, flatC0: c0 };
+            var curve = G.intersectionCurve(Fc, meshGeo, win, flatStyle);
             obj3d.traverse(function (o) {
               if (o.geometry) o.geometry.dispose();
               if (o.material) {
@@ -761,7 +788,8 @@
         }
         case 'curve': {
           var td = row.getDomain('t', 0, 2 * Math.PI);
-          return G.curve(P.makeTupleFn(spec.expr, ['t'], env), td[0], td[1], win, style);
+          return G.curve(P.makeTupleFn(spec.expr, ['t'], env), td[0], td[1], win, style,
+            this._fastMode ? 100 : 0, this.mode2d);
         }
         case 'psurf': {
           var ud = row.getDomain('u', 0, 2 * Math.PI), vd = row.getDomain('v', 0, 2 * Math.PI);
@@ -820,8 +848,9 @@
       if (!this._dragRAF) {
         this._dragRAF = requestAnimationFrame(function () {
           self._dragRAF = null;
+          self.interactFast();
           self.refreshDerived();
-          self.rows.forEach(function (r) { self.buildGeomIfDirty(r); });
+          self.buildAllGeom();
           self.updateValues();
         });
       }
@@ -854,13 +883,48 @@
       var span = (w.xmax - w.xmin) * f;
       if (span < 1e-3 || span > 1e5) return;
       var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2, cz = (w.zmin + w.zmax) / 2;
-      this.viewport.scaleView(f);
+      var flat = this.mode2d;
+      if (!flat) this.viewport.scaleView(f);
       this.setWindow({
         xmin: cx + (w.xmin - cx) * f, xmax: cx + (w.xmax - cx) * f,
         ymin: cy + (w.ymin - cy) * f, ymax: cy + (w.ymax - cy) * f,
-        zmin: cz + (w.zmin - cz) * f, zmax: cz + (w.zmax - cz) * f
+        zmin: flat ? w.zmin : cz + (w.zmin - cz) * f,
+        zmax: flat ? w.zmax : cz + (w.zmax - cz) * f
       });
       this.flashWindowSize();
+    },
+
+    // drag-pan in 2D: window slides under the cursor, coarse rebuilds follow
+    pan2d: function (dx, dy) {
+      var w = this.win;
+      w.xmin += dx; w.xmax += dx; w.ymin += dy; w.ymax += dy;
+      this.viewport.win = w;
+      this.viewport.update2dCamera();
+      var self = this;
+      if (!this._panRAF) {
+        this._panRAF = requestAnimationFrame(function () {
+          self._panRAF = null;
+          self._fastMode = true;
+          self.buildAllGeom();
+        });
+      }
+      clearTimeout(this._panTimer);
+      this._panTimer = setTimeout(function () {
+        self._panTimer = null;
+        self._fastMode = false;
+        self.setWindow(self.win);
+      }, 220);
+    },
+
+    // in 2D the window must match the viewport shape so the grid is edge-to-edge
+    applyAspect2d: function () {
+      var elc = this.viewport.renderer.domElement;
+      var aspect = elc.clientWidth / Math.max(1, elc.clientHeight);
+      var w = this.win;
+      var yr = w.ymax - w.ymin, xc = (w.xmin + w.xmax) / 2, xr = yr * aspect;
+      w.xmin = xc - xr / 2;
+      w.xmax = xc + xr / 2;
+      this.setWindow(w);
     },
 
     // Gesture-speed window step: geometry only, at coarse resolution.
@@ -870,16 +934,22 @@
       var span = (w.xmax - w.xmin) * f;
       if (span < 1e-3 || span > 1e5) return;
       var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2, cz = (w.zmin + w.zmax) / 2;
+      var flat = this.mode2d;
       var nw = {
         xmin: cx + (w.xmin - cx) * f, xmax: cx + (w.xmax - cx) * f,
         ymin: cy + (w.ymin - cy) * f, ymax: cy + (w.ymax - cy) * f,
-        zmin: cz + (w.zmin - cz) * f, zmax: cz + (w.zmax - cz) * f
+        zmin: flat ? w.zmin : cz + (w.zmin - cz) * f,
+        zmax: flat ? w.zmax : cz + (w.zmax - cz) * f
       };
       nw.diag = Math.hypot(nw.xmax - nw.xmin, nw.ymax - nw.ymin, nw.zmax - nw.zmin);
       this.win = nw;
       this.viewport.win = nw;
-      this.viewport.scaleView(f);
-      this.viewport.scaleDecor(f);
+      if (flat) {
+        this.viewport.update2dCamera();
+      } else {
+        this.viewport.scaleView(f);
+        this.viewport.scaleDecor(f);
+      }
       this.buildAllGeom();
       this.flashWindowSize();
     },
@@ -942,6 +1012,20 @@
       });
       document.getElementById('themebtn').addEventListener('click', function () {
         self.applyTheme(self.themeName === 'dark' ? 'light' : 'dark');
+      });
+      var dim = document.getElementById('dimbtn');
+      var syncDim = function () {
+        dim.textContent = self.mode2d ? '3D' : '2D';
+        dim.title = self.mode2d ? 'back to the 3D view' : 'flat top-down 2D view';
+      };
+      syncDim();
+      dim.addEventListener('click', function () {
+        self.mode2d = !self.mode2d;
+        self.viewport.setMode2d(self.mode2d);
+        syncDim();
+        if (self.mode2d) self.applyAspect2d(); // triggers recompute via setWindow
+        else self.recompute();
+        self.saveSoon();
       });
       var zi = document.getElementById('zoomin'), zo = document.getElementById('zoomout');
       zi.title = 'zoom the window in';
@@ -1088,16 +1172,28 @@
       var hp = document.getElementById('docsbody');
       var section = function (title) {
         el('div', 'docsec', hp).textContent = title;
-        return el('div', 'doctext', hp);
+      };
+      var refs = function (pairs) {
+        var box = el('div', 'reflist', hp);
+        pairs.forEach(function (pr) {
+          var row = el('div', 'refrow', box);
+          el('span', 'refk', row).innerHTML = pr[0];
+          el('span', 'refv', row).innerHTML = pr[1];
+        });
       };
 
-      section('Typing math').innerHTML =
-        'Type <b>rho</b>, <b>theta</b>, <b>phi</b>, <b>pi</b>, or <b>tau</b> and it turns into ρ, θ, φ, π, τ. ' +
-        'Press <b>/</b> for a fraction and <b>^</b> for an exponent. <b>sqrt</b> gives a square root, <b>nthroot</b> any other root, <b>|</b> absolute value bars. ' +
-        'Functions like sin, cos, and ln work as written. For log base 2, type <b>log</b> then <b>_2</b>. ' +
-        '<b>Enter</b> adds a row. The arrow keys move between rows. Backspace on an empty row deletes it.';
+      section('Typing');
+      refs([
+        ['<b>rho theta phi pi</b>', '\u03c1 \u03b8 \u03c6 \u03c0'],
+        ['<b>/</b> and <b>^</b>', 'fraction, exponent'],
+        ['<b>sqrt</b>, <b>nthroot</b>', 'roots'],
+        ['<b>log</b> then <b>_2</b>', 'log base 2'],
+        ['<b>Enter</b>', 'new row'],
+        ['<b>\u2191 \u2193</b>', 'move between rows'],
+        ['<b>\u232b</b> on an empty row', 'delete it']
+      ]);
 
-      el('div', 'docsec', hp).textContent = 'Everything you can plot (click to insert)';
+      section('Plot anything (click to insert)');
       var EXAMPLES = [
         ['cylinder', 'r=1'],
         ['half-plane', '\\theta =\\frac{\\pi }{4}'],
@@ -1145,36 +1241,48 @@
           self.saveSoon();
         });
       });
-      section('Coordinates & conventions').innerHTML =
-        'The z axis points up. Cylindrical coordinates are <b>r</b>, <b>θ</b>, <b>z</b>, with θ = atan2(y, x). ' +
-        'Spherical coordinates are <b>ρ</b>, <b>φ</b>, <b>θ</b>, where φ is measured down from the +z axis (0 ≤ φ ≤ π). ' +
-        'An equation that is not solved for a single variable is drawn as an implicit surface. This works in any coordinate system. ' +
-        'Curves use the parameter <b>t</b>. Parametric surfaces use <b>u</b> and <b>v</b>. ' +
-        'Their ranges are editable under the row and accept values like <b>2pi</b> or a slider name. ' +
-        'Tuples with 2 components are drawn in the xy plane: <b>(1, 2)</b> is a point at z = 0, ' +
-        '<b>(cos(t), sin(t))</b> is a flat circle, and <b>G(x,y) = (-y, x)</b> is a 2D vector field.';
+      section('Coordinates');
+      refs([
+        ['z axis', 'points up'],
+        ['\u03b8', 'atan2(y, x)'],
+        ['\u03c6', 'angle from the +z axis'],
+        ['curves', 'parameter <b>t</b>'],
+        ['parametric surfaces', '<b>u</b> and <b>v</b>'],
+        ['2-part tuples', 'drawn in the xy plane'],
+        ['unsolved equations', 'implicit surfaces, any coords']
+      ]);
 
-      section('Sliders & definitions').innerHTML =
-        'Set a free letter equal to a number, like <b>a = 1</b>, and it becomes a slider with min, max, and step. Press ▶ to animate it. ' +
-        'If you use a letter that is not defined yet, the row offers to <b>add a slider</b> for it. ' +
-        'You can also define functions like <b>f(x,y) = …</b>, constants like <b>c = 2a</b>, and named points like <b>P = (1,2,3)</b>, then use them in any other row. Order does not matter.';
+      section('Sliders and names');
+      refs([
+        ['<b>a = 1</b>', 'slider, \u25b6 animates'],
+        ['unknown letter', 'one-click add slider'],
+        ['<b>f(x,y) = \u2026</b>', 'function, usable anywhere'],
+        ['<b>c = 2a</b>, <b>P = (1,2,3)</b>', 'constant, named point']
+      ]);
 
-      section('Curves of intersection').innerHTML =
-        'Type <b>intersection</b> in a row. Two pickers appear, preset to the nearest two surfaces above it. ' +
-        'The curve is drawn as a tube with its own color and hide toggle, and it updates when either surface changes. ' +
-        'Hide both surfaces to study the curve alone. ' +
-        'One of the two surfaces needs an equation form. Two purely parametric surfaces cannot be paired yet.';
+      section('Intersections');
+      refs([
+        ['type <b>intersection</b>', 'two surface pickers appear'],
+        ['hide both surfaces', 'study the curve alone'],
+        ['limit', 'one of the pair needs an equation form']
+      ]);
 
-      section('Window & view').innerHTML =
-        'Scroll, or use the <b>+</b> and <b>−</b> buttons, to zoom the window. The axis ranges scale, for example ±4 to ±8 to ±16, and every plot is redrawn over the new region. A small note shows the new size. ' +
-        'Drag to orbit, right-drag to pan, and press ⌂ to reset the view. ' +
-        'The ⚙ panel sets exact ranges, including asymmetric ones, and toggles the axes, grid, and box.';
+      section('View');
+      refs([
+        ['<b>2D</b>', 'flat top-down view for polar and xy graphs'],
+        ['scroll or <b>+ \u2212</b>', 'zoom the window, axes rescale'],
+        ['drag, right-drag', 'orbit, pan'],
+        ['<b>\u2302</b>', 'reset the view'],
+        ['<b>\u2699</b>', 'exact ranges, axes, grid, box']
+      ]);
 
-      section('Row controls').innerHTML =
-        'Click the colored circle to show or hide a plot. Right-click it, or long-press on touch, for color and opacity. ' +
-        'The gear that appears when you hover a row has detail, mesh lines, vector field density, and point labels. ' +
-        'Surfaces that do not use one of x, y, z, like <b>y = x</b> where z is free, also get a <b>show in 2D</b> checkbox there: it draws the flat curve in the free variable\u2019s zero plane instead of the extruded sheet. ' +
-        'Clicking a row highlights its object in the 3D view. Your work autosaves in this browser.';
+      section('Rows');
+      refs([
+        ['click the circle', 'show or hide the plot'],
+        ['right-click the circle', 'color and opacity'],
+        ['gear', 'detail, mesh, labels, show in 2D'],
+        ['everything', 'autosaves in this browser']
+      ]);
     },
 
     /* ---------------- persistence ---------------- */
@@ -1187,7 +1295,7 @@
       try {
         var state = {
           window: { xmin: this.win.xmin, xmax: this.win.xmax, ymin: this.win.ymin, ymax: this.win.ymax, zmin: this.win.zmin, zmax: this.win.zmax },
-          view: { axes: this.viewport.showAxes, grid: this.viewport.showGrid, box: this.viewport.showBox, theme: this.themeName },
+          view: { axes: this.viewport.showAxes, grid: this.viewport.showGrid, box: this.viewport.showBox, theme: this.themeName, mode2d: this.mode2d },
           rows: this.rows.map(function (r) { return r.serialize(); })
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));

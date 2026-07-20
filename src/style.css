@@ -329,3 +329,10 @@ button { font-family: inherit; cursor: pointer; }
   opacity: 0; transition: opacity 0.25s; pointer-events: none; z-index: 15;
 }
 .wintoast.show { opacity: 1; }
+
+/* docs reference rows */
+.reflist { display: flex; flex-direction: column; gap: 1px; }
+.refrow { display: flex; gap: 10px; font-size: 12.5px; line-height: 1.7; }
+.refk { min-width: 150px; color: var(--text); }
+.refv { color: var(--muted); }
+.refk b { font-weight: 600; color: var(--text); }

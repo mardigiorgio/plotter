@@ -29,10 +29,12 @@ Typing `rho`, `theta`, `phi`, `pi`, or `tau` autocompletes to ρ, θ, φ, π, τ
 Desmos (MathQuill). Unknown letters offer a one-click add-slider button.
 
 Controls: Enter adds a row. Click a row's colored circle to hide its plot and
-right-click it for color and opacity. The `+` and `−` buttons zoom the window
-itself, so the axis ranges grow or shrink and everything replots; the scroll
-wheel moves the camera. The `?` button opens the documentation drawer.
-Everything autosaves to localStorage.
+right-click it for color and opacity. Scroll or use `+` and `−` to zoom the
+window itself, so the axis ranges rescale and everything replots. The `2D`
+button flips to a flat orthographic grapher with a Desmos-style grid: drag to
+pan, scroll to zoom, and curves like `r = 2 + cos(4θ)` or `y = x²/4` draw as
+clean stroked lines. There is a light and a dark theme, and a `?` button with
+a reference card. Everything autosaves to localStorage.
 
 ## Development
 

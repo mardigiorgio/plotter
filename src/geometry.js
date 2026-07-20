@@ -38,14 +38,16 @@
   // (asymptotes) are invalid so no cell bridges the box.
   G.clampBox = function (p, win) {
     // returns 0 = inside, 1 = clamped onto wall, 2 = far outside
-    var lim = [win.xmin, win.xmax, win.ymin, win.ymax, win.zmin, win.zmax];
-    var state = 0;
-    for (var c = 0; c < 3; c++) {
-      var lo = lim[c * 2], hi = lim[c * 2 + 1], far = (hi - lo) * 0.5;
-      if (p[c] < lo - far || p[c] > hi + far) return 2;
-      if (p[c] < lo) { p[c] = lo; state = 1; }
-      else if (p[c] > hi) { p[c] = hi; state = 1; }
-    }
+    var state = 0, lo, hi, far, v;
+    lo = win.xmin; hi = win.xmax; far = (hi - lo) * 0.5; v = p[0];
+    if (v < lo - far || v > hi + far) return 2;
+    if (v < lo) { p[0] = lo; state = 1; } else if (v > hi) { p[0] = hi; state = 1; }
+    lo = win.ymin; hi = win.ymax; far = (hi - lo) * 0.5; v = p[1];
+    if (v < lo - far || v > hi + far) return 2;
+    if (v < lo) { p[1] = lo; state = 1; } else if (v > hi) { p[1] = hi; state = 1; }
+    lo = win.zmin; hi = win.zmax; far = (hi - lo) * 0.5; v = p[2];
+    if (v < lo - far || v > hi + far) return 2;
+    if (v < lo) { p[2] = lo; state = 1; } else if (v > hi) { p[2] = hi; state = 1; }
     return state;
   };
 
@@ -86,7 +88,8 @@
     };
     var valid0 = valid.slice();
     var out = {};
-    for (j = 0; j <= nv; j++) {
+    var refine = nu > 24 && nv > 24; // skip during coarse gesture rebuilds
+    for (j = 0; refine && j <= nv; j++) {
       for (i = 0; i <= nu; i++) {
         k = j * (nu + 1) + i;
         if (valid0[k]) continue;
@@ -128,14 +131,14 @@
     var mesh = new THREE.Mesh(geo, surfaceMaterial(style));
     var group = new THREE.Group();
     group.add(mesh);
-    if (style.mesh) group.add(G.gridLines(fn, u0, u1, v0, v1, win));
+    if (style.mesh) group.add(G.gridLines(fn, u0, u1, v0, v1, win, nu <= 24 || nv <= 24));
     return group;
   };
 
   /* coarse parameter-space grid lines drawn on the surface */
-  G.gridLines = function (fn, u0, u1, v0, v1, win) {
+  G.gridLines = function (fn, u0, u1, v0, v1, win, coarse) {
     var pts = [];
-    var NL = 12, NS = 48; // NL lines each way, NS segments per line
+    var NL = coarse ? 6 : 12, NS = coarse ? 16 : 48; // lines each way, segments per line
     function sample(uu, vv) {
       var p;
       try { p = fn(uu, vv); } catch (e) { return null; }
@@ -222,8 +225,8 @@
   };
 
   /* ---------- space curve ---------- */
-  G.curve = function (fn, t0, t1, win, style) {
-    var N = 400, limit = win.diag * 2.5;
+  G.curve = function (fn, t0, t1, win, style, segs, flat) {
+    var N = segs ? 120 : 400, limit = win.diag * 2.5;
     var samples = [], allOk = true;
     for (var i = 0; i <= N; i++) {
       var t = t0 + (t1 - t0) * i / N, p;
@@ -233,13 +236,24 @@
       samples.push(ok ? p : null);
       if (!ok) allOk = false;
     }
+    if (allOk && flat) {
+      var planar = true;
+      for (var fi = 0; fi <= N && planar; fi++) {
+        if (Math.abs(samples[fi][2]) > win.diag * 1e-6) planar = false;
+      }
+      if (planar) return G.flatRibbon([samples], 2, 0, win, style);
+    }
     if (allOk) {
       var curveObj = new THREE.Curve();
+      // lerp the samples we already have instead of re-calling fn
       curveObj.getPoint = function (q, target) {
-        var p2 = fn(t0 + (t1 - t0) * q);
-        return (target || new THREE.Vector3()).set(p2[0], p2[1], p2[2]);
+        var x = q * N, i0 = Math.min(Math.floor(x), N - 1), f = x - i0;
+        var a2 = samples[i0], b2 = samples[i0 + 1];
+        return (target || new THREE.Vector3()).set(
+          a2[0] + (b2[0] - a2[0]) * f, a2[1] + (b2[1] - a2[1]) * f, a2[2] + (b2[2] - a2[2]) * f);
       };
-      var tube = new THREE.TubeGeometry(curveObj, 300, win.diag * 0.004, 8, false);
+      curveObj.arcLengthDivisions = segs ? 60 : 200;
+      var tube = new THREE.TubeGeometry(curveObj, segs || 300, win.diag * 0.004, segs ? 6 : 8, false);
       return new THREE.Mesh(tube, surfaceMaterial({ color: style.color, opacity: style.opacity }));
     }
     // gaps → polyline segments
@@ -263,33 +277,47 @@
     return mesh;
   };
 
+  var spriteCache = new Map(); // text+style → {tex, w, h}; textures are shared
+  G.clearSpriteCache = function () {
+    spriteCache.forEach(function (e) { e.tex.dispose(); });
+    spriteCache.clear();
+  };
   G.textSprite = function (text, opts) {
     opts = opts || {};
-    var fontPx = 46;
-    var font = opts.italic ? 'italic 500 ' + fontPx + 'px Georgia, serif'
-      : opts.serif ? '500 ' + fontPx + 'px Georgia, serif'
-      : '500 ' + fontPx + 'px system-ui, sans-serif';
-    var canvas = document.createElement('canvas');
-    var c2 = canvas.getContext('2d');
-    c2.font = font;
-    var w = Math.ceil(c2.measureText(text).width) + 16;
-    var h = fontPx + 18;
-    canvas.width = w; canvas.height = h;
-    c2 = canvas.getContext('2d');
-    c2.font = font;
-    c2.textBaseline = 'middle';
-    if (opts.halo !== false) {
-      c2.lineWidth = 8; c2.strokeStyle = opts.haloColor || 'rgba(255,255,255,0.9)';
-      c2.strokeText(text, 8, h / 2);
+    var key = text + '|' + (opts.italic ? 1 : 0) + (opts.serif ? 1 : 0) + '|' +
+      (opts.color || '') + '|' + (opts.haloColor || '');
+    var entry = spriteCache.get(key);
+    if (!entry) {
+      var fontPx = 46;
+      var font = opts.italic ? 'italic 500 ' + fontPx + 'px Georgia, serif'
+        : opts.serif ? '500 ' + fontPx + 'px Georgia, serif'
+        : '500 ' + fontPx + 'px system-ui, sans-serif';
+      var canvas = document.createElement('canvas');
+      var c2 = canvas.getContext('2d');
+      c2.font = font;
+      var w = Math.ceil(c2.measureText(text).width) + 16;
+      var h = fontPx + 18;
+      canvas.width = w; canvas.height = h;
+      c2 = canvas.getContext('2d');
+      c2.font = font;
+      c2.textBaseline = 'middle';
+      if (opts.halo !== false) {
+        c2.lineWidth = 8; c2.strokeStyle = opts.haloColor || 'rgba(255,255,255,0.9)';
+        c2.strokeText(text, 8, h / 2);
+      }
+      c2.fillStyle = opts.color || '#333';
+      c2.fillText(text, 8, h / 2);
+      var tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      tex._shared = true; // never disposed by scene teardown, only by clearSpriteCache
+      if (spriteCache.size > 400) G.clearSpriteCache();
+      entry = { tex: tex, w: w, h: h };
+      spriteCache.set(key, entry);
     }
-    c2.fillStyle = opts.color || '#333';
-    c2.fillText(text, 8, h / 2);
-    var tex = new THREE.CanvasTexture(canvas);
-    tex.minFilter = THREE.LinearFilter;
-    var mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    var mat = new THREE.SpriteMaterial({ map: entry.tex, depthTest: false, transparent: true });
     var sp = new THREE.Sprite(mat);
     var worldH = (opts.worldH || 0.36);
-    sp.scale.set(worldH * w / h, worldH, 1);
+    sp.scale.set(worldH * entry.w / entry.h, worldH, 1);
     sp.renderOrder = 999;
     return sp;
   };
@@ -475,14 +503,49 @@
     var posArr = new Float32Array(positions);
     var normArr = new Float32Array(positions.length);
     var eps = Math.min(hx, hy, hz) * 0.5;
+    // gradient at lattice node via central differences of the sampled field
+    var nodeGrad = function (i2, j2, k2, out2) {
+      var ia = i2 > 0 ? i2 - 1 : i2, ib = i2 < nx - 1 ? i2 + 1 : i2;
+      var ja = j2 > 0 ? j2 - 1 : j2, jb = j2 < nx - 1 ? j2 + 1 : j2;
+      var ka = k2 > 0 ? k2 - 1 : k2, kb = k2 < nx - 1 ? k2 + 1 : k2;
+      var vxa = at(ia, j2, k2), vxb = at(ib, j2, k2);
+      var vya = at(i2, ja, k2), vyb = at(i2, jb, k2);
+      var vza = at(i2, j2, ka), vzb = at(i2, j2, kb);
+      if (!isFinite(vxa) || !isFinite(vxb) || !isFinite(vya) || !isFinite(vyb) ||
+          !isFinite(vza) || !isFinite(vzb)) return false;
+      out2[0] = (vxb - vxa) / ((ib - ia) * hx);
+      out2[1] = (vyb - vya) / ((jb - ja) * hy);
+      out2[2] = (vzb - vza) / ((kb - ka) * hz);
+      return true;
+    };
+    var cg = [0, 0, 0];
     for (var vI = 0; vI < n; vI++) {
       var px = posArr[vI * 3], py = posArr[vI * 3 + 1], pz = posArr[vI * 3 + 2];
-      var gx, gy, gz;
-      try {
-        gx = F(px + eps, py, pz) - F(px - eps, py, pz);
-        gy = F(px, py + eps, pz) - F(px, py - eps, pz);
-        gz = F(px, py, pz + eps) - F(px, py, pz - eps);
-      } catch (e) { gx = gy = gz = NaN; }
+      var gx = 0, gy = 0, gz = 0;
+      // trilinear blend of the 8 surrounding lattice-node gradients (no F calls)
+      var fx2 = (px - x0) / hx, fy2 = (py - y0) / hy, fz2 = (pz - z0) / hz;
+      var i0g = Math.max(0, Math.min(nx - 2, Math.floor(fx2)));
+      var j0g = Math.max(0, Math.min(nx - 2, Math.floor(fy2)));
+      var k0g = Math.max(0, Math.min(nx - 2, Math.floor(fz2)));
+      var tx = Math.max(0, Math.min(1, fx2 - i0g));
+      var ty = Math.max(0, Math.min(1, fy2 - j0g));
+      var tz = Math.max(0, Math.min(1, fz2 - k0g));
+      var okAll = true;
+      for (var c8 = 0; c8 < 8 && okAll; c8++) {
+        var di = c8 & 1, dj = (c8 >> 1) & 1, dk = (c8 >> 2) & 1;
+        var w8 = (di ? tx : 1 - tx) * (dj ? ty : 1 - ty) * (dk ? tz : 1 - tz);
+        if (w8 === 0) continue;
+        if (!nodeGrad(i0g + di, j0g + dj, k0g + dk, cg)) { okAll = false; break; }
+        gx += w8 * cg[0]; gy += w8 * cg[1]; gz += w8 * cg[2];
+      }
+      if (!okAll) {
+        // rare: field undefined nearby; fall back to direct evaluation
+        try {
+          gx = F(px + eps, py, pz) - F(px - eps, py, pz);
+          gy = F(px, py + eps, pz) - F(px, py - eps, pz);
+          gz = F(px, py, pz + eps) - F(px, py, pz - eps);
+        } catch (e) { gx = gy = gz = NaN; }
+      }
       var gl = Math.sqrt(gx * gx + gy * gy + gz * gz);
       if (!isFinite(gl) || gl === 0) { gx = 0; gy = 0; gz = 1; gl = 1; }
       normArr[vI * 3] = gx / gl; normArr[vI * 3 + 1] = gy / gl; normArr[vI * 3 + 2] = gz / gl;
@@ -517,6 +580,53 @@
       var grp = new THREE.Group(); grp.add(mesh, wf); return grp;
     }
     return mesh;
+  };
+
+  /* flat stroked line in the plane {axes[axIdx]=c0}: a thin unlit ribbon */
+  G.flatRibbon = function (polylines, axIdx, c0, win, style) {
+    // width relative to the vertical range: constant on-screen stroke in 2D
+    var w = (win.ymax - win.ymin) * 0.0028;
+    var lift = c0 + (win.ymax - win.ymin) * 0.0005; // avoid z-fighting the grid plane
+    var ia = axIdx === 0 ? 1 : 0;      // in-plane axis a
+    var ib = axIdx === 2 ? 1 : 2;      // in-plane axis b
+    var positions = [], indices = [];
+    polylines.forEach(function (poly) {
+      var n = poly.length;
+      if (n < 2) return;
+      var closed = n > 3 && Math.hypot(
+        poly[0][ia] - poly[n - 1][ia], poly[0][ib] - poly[n - 1][ib]) < win.diag * 0.01;
+      if (closed) { poly = poly.slice(0, n - 1); n = poly.length; }
+      var base = positions.length / 3;
+      for (var i = 0; i < n; i++) {
+        var ip = closed ? (i - 1 + n) % n : Math.max(0, i - 1);
+        var inx = closed ? (i + 1) % n : Math.min(n - 1, i + 1);
+        var ta = poly[inx][ia] - poly[ip][ia];
+        var tb = poly[inx][ib] - poly[ip][ib];
+        var tl = Math.hypot(ta, tb) || 1;
+        var na = -tb / tl, nb = ta / tl;
+        var pt = [0, 0, 0];
+        pt[axIdx] = lift;
+        pt[ia] = poly[i][ia] + na * w; pt[ib] = poly[i][ib] + nb * w;
+        positions.push(pt[0], pt[1], pt[2]);
+        pt[ia] = poly[i][ia] - na * w; pt[ib] = poly[i][ib] - nb * w;
+        positions.push(pt[0], pt[1], pt[2]);
+      }
+      var segCount = closed ? n : n - 1;
+      for (var s2 = 0; s2 < segCount; s2++) {
+        var a0 = base + s2 * 2, b0 = base + ((s2 + 1) % n) * 2;
+        indices.push(a0, a0 + 1, b0 + 1, a0, b0 + 1, b0);
+      }
+    });
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.setIndex(indices);
+    var op = style.opacity !== undefined ? style.opacity : 1;
+    var mat = new THREE.MeshBasicMaterial({
+      color: style.color, side: THREE.DoubleSide,
+      transparent: op < 1, opacity: op
+    });
+    mat._styleOpacity = true;
+    return new THREE.Mesh(geo, mat);
   };
 
   /* triangulated plane at freeVar = 0 (clamped into the window), for 2D traces */
@@ -556,28 +666,29 @@
     var pos = geometry.getAttribute('position');
     var idx = geometry.getIndex();
     var triCount = idx ? idx.count / 3 : pos.count / 3;
-    var vert = function (t, k) { // k-th corner of triangle t
-      var vi = idx ? idx.getX(t * 3 + k) : t * 3 + k;
-      return [pos.getX(vi), pos.getY(vi), pos.getZ(vi)];
-    };
+    // evaluate F once per unique vertex
+    var fv = new Float64Array(pos.count);
+    for (var vi = 0; vi < pos.count; vi++) {
+      var val;
+      try { val = F(pos.getX(vi), pos.getY(vi), pos.getZ(vi)); } catch (e) { val = NaN; }
+      fv[vi] = isFinite(val) ? val : NaN;
+    }
+    var vidx = function (t, k) { return idx ? idx.getX(t * 3 + k) : t * 3 + k; };
     var segs = [];
+    var ids = [0, 0, 0];
     for (var t = 0; t < triCount; t++) {
-      var p = [vert(t, 0), vert(t, 1), vert(t, 2)];
-      var f = [0, 0, 0], bad = false;
-      for (var k = 0; k < 3; k++) {
-        try { f[k] = F(p[k][0], p[k][1], p[k][2]); } catch (e) { bad = true; break; }
-        if (!isFinite(f[k])) { bad = true; break; }
-      }
-      if (bad) continue;
+      ids[0] = vidx(t, 0); ids[1] = vidx(t, 1); ids[2] = vidx(t, 2);
+      if (isNaN(fv[ids[0]]) || isNaN(fv[ids[1]]) || isNaN(fv[ids[2]])) continue;
       var cross = [];
-      for (k = 0; k < 3; k++) {
-        var k2 = (k + 1) % 3;
-        if ((f[k] < 0) !== (f[k2] < 0)) {
-          var s = f[k] / (f[k] - f[k2]);
+      for (var k = 0; k < 3; k++) {
+        var ia = ids[k], ib = ids[(k + 1) % 3];
+        var fa = fv[ia], fb = fv[ib];
+        if ((fa < 0) !== (fb < 0)) {
+          var s = fa / (fa - fb);
           cross.push([
-            p[k][0] + (p[k2][0] - p[k][0]) * s,
-            p[k][1] + (p[k2][1] - p[k][1]) * s,
-            p[k][2] + (p[k2][2] - p[k][2]) * s]);
+            pos.getX(ia) + (pos.getX(ib) - pos.getX(ia)) * s,
+            pos.getY(ia) + (pos.getY(ib) - pos.getY(ia)) * s,
+            pos.getZ(ia) + (pos.getZ(ib) - pos.getZ(ia)) * s]);
         }
       }
       if (cross.length === 2) segs.push([cross[0], cross[1]]);
@@ -622,6 +733,9 @@
       polylines.push(line);
     }
 
+    if (style.flatAxis !== undefined) {
+      return G.flatRibbon(polylines, style.flatAxis, style.flatC0 || 0, win, style);
+    }
     var mat = solidMaterial(style, 50);
     polylines.forEach(function (line) {
       if (line.length < 2) return;
