@@ -3275,6 +3275,36 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
     return mesh;
   };
 
+  /* triangulated plane at freeVar = 0 (clamped into the window), for 2D traces */
+  G.gridPlane = function (freeVar, win, n) {
+    var lim = { x: [win.xmin, win.xmax], y: [win.ymin, win.ymax], z: [win.zmin, win.zmax] };
+    var axes = ['x', 'y', 'z'].filter(function (a) { return a !== freeVar; });
+    var A = lim[axes[0]], B = lim[axes[1]];
+    var c = Math.max(lim[freeVar][0], Math.min(lim[freeVar][1], 0));
+    var idxMap = { x: 0, y: 1, z: 2 };
+    var ia = idxMap[axes[0]], ib = idxMap[axes[1]], ic = idxMap[freeVar];
+    var pos = new Float32Array((n + 1) * (n + 1) * 3);
+    var k = 0;
+    for (var j = 0; j <= n; j++) {
+      for (var i = 0; i <= n; i++, k++) {
+        pos[k * 3 + ia] = A[0] + (A[1] - A[0]) * i / n;
+        pos[k * 3 + ib] = B[0] + (B[1] - B[0]) * j / n;
+        pos[k * 3 + ic] = c;
+      }
+    }
+    var indices = [];
+    for (j = 0; j < n; j++) {
+      for (i = 0; i < n; i++) {
+        var a2 = j * (n + 1) + i, b2 = a2 + 1, c2 = a2 + n + 1, d2 = c2 + 1;
+        indices.push(a2, b2, d2, a2, d2, c2);
+      }
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setIndex(indices);
+    return geo;
+  };
+
   /* ---------- curve of intersection ----------
    * F: implicit form of surface A; geometry: rendered mesh of surface B.
    * Zero-crossings of F over B's triangles → segments → chained polylines → tubes. */
@@ -3405,8 +3435,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
   P.Viewport = function (container) {
     var self = this;
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
     this.renderer.setClearColor(0xffffff, 1);
     container.appendChild(this.renderer.domElement);
 
@@ -3715,7 +3745,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       label: state.label || '',
       domains: state.domains || {}, // {t0,t1,u0,u1,v0,v1} strings
       slider: state.slider || { min: '-10', max: '10', step: '' },
-      isect: state.isect || null   // {a: rowIndex, b: rowIndex} (persistence only)
+      isect: state.isect || null,  // {a: rowIndex, b: rowIndex} (persistence only)
+      flat2d: !!state.flat2d       // draw the flat trace instead of the extruded sheet
     };
     this._isectA = null; // live row references, resolved by the app
     this._isectB = null;
@@ -4070,6 +4101,19 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         });
       }
 
+      // surfaces with an unused variable (y = x leaves z free) can draw flat
+      if (this.app.flat2dInfo(this)) {
+        var f2r = el('div', 'setrow', box);
+        el('span', 'setlab', f2r).textContent = 'show in 2D';
+        var f2chk = el('input', '', f2r);
+        f2chk.type = 'checkbox'; f2chk.checked = !!s.flat2d;
+        f2chk.addEventListener('change', function () {
+          s.flat2d = f2chk.checked;
+          self.app.rebuildRow(self);
+          self.app.saveSoon();
+        });
+      }
+
       if (type === 'vfield' || (type === 'definition' && this.spec.render && this.spec.render.type === 'vfield')) {
         slider('density', 3, 10, 1, s.density, function (v) {
           s.density = v;
@@ -4095,7 +4139,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         latex: this.state.latex, hidden: this.state.hidden, color: this.state.color,
         opacity: this.state.opacity, mesh: this.state.mesh, res: this.state.res,
         density: this.state.density, label: this.state.label,
-        domains: this.state.domains, slider: this.state.slider
+        domains: this.state.domains, slider: this.state.slider,
+        flat2d: this.state.flat2d
       };
       if (this._isectA || this._isectB) {
         out.isect = {
@@ -4530,6 +4575,39 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       } catch (e) { return null; }
       return null;
     },
+    /* which cartesian variable (if any) the surface does not use, e.g. z for y=x */
+    flat2dInfo: function (row) {
+      var spec = row.spec && row.spec.type === 'definition' ? row.spec.render : row.spec;
+      if (!spec) return null;
+      var env = this.env;
+      var MAP = { x: ['x'], y: ['y'], z: ['z'], r: ['x', 'y'], theta: ['x', 'y'], rho: ['x', 'y', 'z'], phi: ['x', 'y', 'z'] };
+      var used = new Set();
+      var addFrees = function (node, extra) {
+        (extra || []).forEach(function (v) { used.add(v); });
+        if (!node) return;
+        P.freeVars(node, env, new Set()).forEach(function (n) {
+          (MAP[n] || []).forEach(function (v) { used.add(v); });
+        });
+      };
+      switch (spec.type) {
+        case 'graph':
+          if (spec.mode === 'polar') return null;
+          addFrees(spec.expr, [spec.axis]);
+          break;
+        case 'cyl': addFrees(spec.expr, ['x', 'y']); break;
+        case 'thetaSurf':
+          if (!spec.isConst) return null;
+          addFrees(spec.expr, ['x', 'y']);
+          break;
+        case 'implicit': case 'region': addFrees(spec.F, []); break;
+        default: return null;
+      }
+      if (!used.has('z')) return 'z';
+      if (!used.has('y')) return 'y';
+      if (!used.has('x')) return 'x';
+      return null;
+    },
+
     meshGeometryFor: function (row) {
       var obj = this.viewport.objects[row.id];
       if (!obj) return null;
@@ -4731,7 +4809,8 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       });
       // note: opacity is intentionally NOT in the key — it is applied live to materials
       return JSON.stringify([s.latex, spec.type, w, s.color, s.mesh, s.res, s.density, s.label,
-        s.domains, domVals, deps, this.viewport.showBox, this._fastMode ? 'fast' : 'full']);
+        s.domains, domVals, deps, this.viewport.showBox, s.flat2d ? '2d' : '3d',
+        this._fastMode ? 'fast' : 'full']);
     },
 
     buildGeomIfDirty: function (row) {
@@ -4740,6 +4819,9 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         'curve', 'psurf', 'point', 'namedPoint', 'vector', 'vfield', 'intersect'].indexOf(spec.type) !== -1 ||
         (spec.type === 'definition' && spec.render);
       if (!renderable) return;
+      // intersection curves and 2D traces do not move when only the window
+      // changes; keep them as-is during zoom gestures, rebuild at settle
+      if (this._fastMode && (spec.type === 'intersect' || row.state.flat2d)) return;
       var key = this.buildKey(row);
       if (this._buildKeys[row.id] === key && this.viewport.objects[row.id]) return;
       this._buildKeys[row.id] = key;
@@ -4766,6 +4848,16 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       var style = { color: s.color, opacity: s.opacity, mesh: s.mesh };
       var res = s.res || 64;
       if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
+
+      // "show in 2D": trace the surface against the unused variable's zero plane
+      if (s.flat2d) {
+        var fv = this.flat2dInfo(row);
+        var F2 = fv ? this.implicitFnFor(row) : null;
+        if (F2) {
+          var plane = G.gridPlane(fv, win, this._fastMode ? 32 : 96);
+          return G.intersectionCurve(F2, plane, win, style);
+        }
+      }
       var assertFinite = function (p, what) {
         if (!p || !p.every(isFinite)) throw new Error(what + ' is undefined');
         return p;
@@ -4782,12 +4874,12 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
         case 'phiSurf': return G.phiSurf(P.makeFn(spec.expr, ['rho', 'theta'], env), win, style, res);
         case 'implicit': {
           var iRes = s.res ? Math.max(20, Math.min(96, Math.round(s.res * 0.75))) : 44;
-          if (this._fastMode) iRes = 20;
+          if (this._fastMode) iRes = 16;
           return G.implicit(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, iRes);
         }
         case 'region': {
           var rRes = s.res ? Math.max(20, Math.min(80, Math.round(s.res * 0.6))) : 44;
-          if (this._fastMode) rRes = 18;
+          if (this._fastMode) rRes = 16;
           return G.region(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, rRes);
         }
         case 'curve': {
@@ -5166,6 +5258,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       section('Row controls').innerHTML =
         'Click the colored circle to show or hide a plot. Right-click it, or long-press on touch, for color and opacity. ' +
         'The gear that appears when you hover a row has detail, mesh lines, vector field density, and point labels. ' +
+        'Surfaces that do not use one of x, y, z, like <b>y = x</b> where z is free, also get a <b>show in 2D</b> checkbox there: it draws the flat curve in the free variable\u2019s zero plane instead of the extruded sheet. ' +
         'Clicking a row highlights its object in the 3D view. Your work autosaves in this browser.';
     },
 

@@ -20,8 +20,8 @@
   P.Viewport = function (container) {
     var self = this;
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
     this.renderer.setClearColor(0xffffff, 1);
     container.appendChild(this.renderer.domElement);
 

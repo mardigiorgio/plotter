@@ -419,6 +419,39 @@
       } catch (e) { return null; }
       return null;
     },
+    /* which cartesian variable (if any) the surface does not use, e.g. z for y=x */
+    flat2dInfo: function (row) {
+      var spec = row.spec && row.spec.type === 'definition' ? row.spec.render : row.spec;
+      if (!spec) return null;
+      var env = this.env;
+      var MAP = { x: ['x'], y: ['y'], z: ['z'], r: ['x', 'y'], theta: ['x', 'y'], rho: ['x', 'y', 'z'], phi: ['x', 'y', 'z'] };
+      var used = new Set();
+      var addFrees = function (node, extra) {
+        (extra || []).forEach(function (v) { used.add(v); });
+        if (!node) return;
+        P.freeVars(node, env, new Set()).forEach(function (n) {
+          (MAP[n] || []).forEach(function (v) { used.add(v); });
+        });
+      };
+      switch (spec.type) {
+        case 'graph':
+          if (spec.mode === 'polar') return null;
+          addFrees(spec.expr, [spec.axis]);
+          break;
+        case 'cyl': addFrees(spec.expr, ['x', 'y']); break;
+        case 'thetaSurf':
+          if (!spec.isConst) return null;
+          addFrees(spec.expr, ['x', 'y']);
+          break;
+        case 'implicit': case 'region': addFrees(spec.F, []); break;
+        default: return null;
+      }
+      if (!used.has('z')) return 'z';
+      if (!used.has('y')) return 'y';
+      if (!used.has('x')) return 'x';
+      return null;
+    },
+
     meshGeometryFor: function (row) {
       var obj = this.viewport.objects[row.id];
       if (!obj) return null;
@@ -620,7 +653,8 @@
       });
       // note: opacity is intentionally NOT in the key — it is applied live to materials
       return JSON.stringify([s.latex, spec.type, w, s.color, s.mesh, s.res, s.density, s.label,
-        s.domains, domVals, deps, this.viewport.showBox, this._fastMode ? 'fast' : 'full']);
+        s.domains, domVals, deps, this.viewport.showBox, s.flat2d ? '2d' : '3d',
+        this._fastMode ? 'fast' : 'full']);
     },
 
     buildGeomIfDirty: function (row) {
@@ -629,6 +663,9 @@
         'curve', 'psurf', 'point', 'namedPoint', 'vector', 'vfield', 'intersect'].indexOf(spec.type) !== -1 ||
         (spec.type === 'definition' && spec.render);
       if (!renderable) return;
+      // intersection curves and 2D traces do not move when only the window
+      // changes; keep them as-is during zoom gestures, rebuild at settle
+      if (this._fastMode && (spec.type === 'intersect' || row.state.flat2d)) return;
       var key = this.buildKey(row);
       if (this._buildKeys[row.id] === key && this.viewport.objects[row.id]) return;
       this._buildKeys[row.id] = key;
@@ -655,6 +692,16 @@
       var style = { color: s.color, opacity: s.opacity, mesh: s.mesh };
       var res = s.res || 64;
       if (this._fastMode) res = Math.min(res, 24); // coarse meshes while zoom-scrolling
+
+      // "show in 2D": trace the surface against the unused variable's zero plane
+      if (s.flat2d) {
+        var fv = this.flat2dInfo(row);
+        var F2 = fv ? this.implicitFnFor(row) : null;
+        if (F2) {
+          var plane = G.gridPlane(fv, win, this._fastMode ? 32 : 96);
+          return G.intersectionCurve(F2, plane, win, style);
+        }
+      }
       var assertFinite = function (p, what) {
         if (!p || !p.every(isFinite)) throw new Error(what + ' is undefined');
         return p;
@@ -671,12 +718,12 @@
         case 'phiSurf': return G.phiSurf(P.makeFn(spec.expr, ['rho', 'theta'], env), win, style, res);
         case 'implicit': {
           var iRes = s.res ? Math.max(20, Math.min(96, Math.round(s.res * 0.75))) : 44;
-          if (this._fastMode) iRes = 20;
+          if (this._fastMode) iRes = 16;
           return G.implicit(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, iRes);
         }
         case 'region': {
           var rRes = s.res ? Math.max(20, Math.min(80, Math.round(s.res * 0.6))) : 44;
-          if (this._fastMode) rRes = 18;
+          if (this._fastMode) rRes = 16;
           return G.region(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, rRes);
         }
         case 'curve': {
@@ -1055,6 +1102,7 @@
       section('Row controls').innerHTML =
         'Click the colored circle to show or hide a plot. Right-click it, or long-press on touch, for color and opacity. ' +
         'The gear that appears when you hover a row has detail, mesh lines, vector field density, and point labels. ' +
+        'Surfaces that do not use one of x, y, z, like <b>y = x</b> where z is free, also get a <b>show in 2D</b> checkbox there: it draws the flat curve in the free variable\u2019s zero plane instead of the extruded sheet. ' +
         'Clicking a row highlights its object in the 3D view. Your work autosaves in this browser.';
     },
 

@@ -65,7 +65,8 @@
       label: state.label || '',
       domains: state.domains || {}, // {t0,t1,u0,u1,v0,v1} strings
       slider: state.slider || { min: '-10', max: '10', step: '' },
-      isect: state.isect || null   // {a: rowIndex, b: rowIndex} (persistence only)
+      isect: state.isect || null,  // {a: rowIndex, b: rowIndex} (persistence only)
+      flat2d: !!state.flat2d       // draw the flat trace instead of the extruded sheet
     };
     this._isectA = null; // live row references, resolved by the app
     this._isectB = null;
@@ -420,6 +421,19 @@
         });
       }
 
+      // surfaces with an unused variable (y = x leaves z free) can draw flat
+      if (this.app.flat2dInfo(this)) {
+        var f2r = el('div', 'setrow', box);
+        el('span', 'setlab', f2r).textContent = 'show in 2D';
+        var f2chk = el('input', '', f2r);
+        f2chk.type = 'checkbox'; f2chk.checked = !!s.flat2d;
+        f2chk.addEventListener('change', function () {
+          s.flat2d = f2chk.checked;
+          self.app.rebuildRow(self);
+          self.app.saveSoon();
+        });
+      }
+
       if (type === 'vfield' || (type === 'definition' && this.spec.render && this.spec.render.type === 'vfield')) {
         slider('density', 3, 10, 1, s.density, function (v) {
           s.density = v;
@@ -445,7 +459,8 @@
         latex: this.state.latex, hidden: this.state.hidden, color: this.state.color,
         opacity: this.state.opacity, mesh: this.state.mesh, res: this.state.res,
         density: this.state.density, label: this.state.label,
-        domains: this.state.domains, slider: this.state.slider
+        domains: this.state.domains, slider: this.state.slider,
+        flat2d: this.state.flat2d
       };
       if (this._isectA || this._isectB) {
         out.isect = {

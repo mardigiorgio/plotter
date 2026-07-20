@@ -475,6 +475,36 @@
     return mesh;
   };
 
+  /* triangulated plane at freeVar = 0 (clamped into the window), for 2D traces */
+  G.gridPlane = function (freeVar, win, n) {
+    var lim = { x: [win.xmin, win.xmax], y: [win.ymin, win.ymax], z: [win.zmin, win.zmax] };
+    var axes = ['x', 'y', 'z'].filter(function (a) { return a !== freeVar; });
+    var A = lim[axes[0]], B = lim[axes[1]];
+    var c = Math.max(lim[freeVar][0], Math.min(lim[freeVar][1], 0));
+    var idxMap = { x: 0, y: 1, z: 2 };
+    var ia = idxMap[axes[0]], ib = idxMap[axes[1]], ic = idxMap[freeVar];
+    var pos = new Float32Array((n + 1) * (n + 1) * 3);
+    var k = 0;
+    for (var j = 0; j <= n; j++) {
+      for (var i = 0; i <= n; i++, k++) {
+        pos[k * 3 + ia] = A[0] + (A[1] - A[0]) * i / n;
+        pos[k * 3 + ib] = B[0] + (B[1] - B[0]) * j / n;
+        pos[k * 3 + ic] = c;
+      }
+    }
+    var indices = [];
+    for (j = 0; j < n; j++) {
+      for (i = 0; i < n; i++) {
+        var a2 = j * (n + 1) + i, b2 = a2 + 1, c2 = a2 + n + 1, d2 = c2 + 1;
+        indices.push(a2, b2, d2, a2, d2, c2);
+      }
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setIndex(indices);
+    return geo;
+  };
+
   /* ---------- curve of intersection ----------
    * F: implicit form of surface A; geometry: rendered mesh of surface B.
    * Zero-crossings of F over B's triangles → segments → chained polylines → tubes. */
