@@ -143,10 +143,15 @@
       if (this.showGrid) {
         var pts = [];
         var sx = niceStep(win.xmax - win.xmin), sy = niceStep(win.ymax - win.ymin);
+        // zero lines coincide with the axes; drawing both makes them z-fight
+        var yAxisDrawn = this.showAxes && win.ymin <= 0 && win.ymax >= 0;
+        var xAxisDrawn = this.showAxes && win.xmin <= 0 && win.xmax >= 0;
         for (var gx = Math.ceil(win.xmin / sx) * sx; gx <= win.xmax + 1e-9; gx += sx) {
+          if (yAxisDrawn && Math.abs(gx) < sx * 0.001) continue;
           pts.push(gx, win.ymin, 0, gx, win.ymax, 0);
         }
         for (var gy = Math.ceil(win.ymin / sy) * sy; gy <= win.ymax + 1e-9; gy += sy) {
+          if (xAxisDrawn && Math.abs(gy) < sy * 0.001) continue;
           pts.push(win.xmin, gy, 0, win.xmax, gy, 0);
         }
         if (win.zmin <= 0 && win.zmax >= 0) this.decor.add(line(pts, 0xdddddd, 1));
