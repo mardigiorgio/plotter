@@ -568,6 +568,22 @@
       // deep bisection to the domain boundary, then log-spaced samples along
       // the asymptote so tails curve down as far as double precision allows
       var LADDER = 22;
+      var xr2 = xhi - xlo, yr2 = yhi - ylo;
+      // a tail still diverging at the deepest representable sample is a true
+      // asymptote: extend it straight to the clip edge (pixel-correct)
+      var snapEdge = function (arr, atStart) {
+        if (arr.length < 2) return;
+        var p0 = atStart ? arr[0] : arr[arr.length - 1];
+        var p1 = atStart ? arr[1] : arr[arr.length - 2];
+        var dx2 = p0[0] - p1[0], dy2 = p0[1] - p1[1];
+        var pt = null;
+        if (Math.abs(dy2) / yr2 > Math.abs(dx2) / xr2) {
+          if (Math.abs(dy2) > yr2 * 0.002) pt = [p0[0], dy2 < 0 ? ylo : yhi, 0];
+        } else if (Math.abs(dx2) > xr2 * 0.002) {
+          pt = [dx2 < 0 ? xlo : xhi, p0[1], 0];
+        }
+        if (pt) { if (atStart) arr.unshift(pt); else arr.push(pt); }
+      };
       var ladder = function (edgeT, farT) {
         var span = Math.abs(farT - edgeT);
         if (!(span > 0)) return [];
@@ -588,12 +604,13 @@
         if (p && !prevOk && i > 0) {
           // entering the domain
           var lo = prevT, hi = t;
-          for (var it = 0; it < 90; it++) {
+          for (var it = 0; it < 600; it++) {
             var mid = (lo + hi) / 2;
             if (mid === lo || mid === hi) break;
             if (sample(mid)) hi = mid; else lo = mid;
           }
           cur = ladder(hi, t);
+          snapEdge(cur, true);
         }
         if (p) {
           if (!cur) cur = [];
@@ -601,7 +618,7 @@
         } else if (prevOk) {
           // leaving the domain
           var lo2 = prevT, hi2 = t;
-          for (var it2 = 0; it2 < 90; it2++) {
+          for (var it2 = 0; it2 < 600; it2++) {
             var mid2 = (lo2 + hi2) / 2;
             if (mid2 === lo2 || mid2 === hi2) break;
             if (sample(mid2)) lo2 = mid2; else hi2 = mid2;
@@ -609,6 +626,7 @@
           var down = ladder(lo2, prevT);
           down.reverse();
           cur = cur.concat(down);
+          snapEdge(cur, false);
           if (cur.length > 1) polys.push(cur);
           cur = null;
         }
