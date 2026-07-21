@@ -194,47 +194,32 @@
       if (!skipSave) this.saveSoon();
     },
 
-    // in 2D everything is computed over ~2.5x the visible region, so pan and
-    // zoom can move only the camera; the region re-centers when gestures settle
+    // curves are sampled directly over the visible window (see planarPolylines /
+    // the implicit sampler), never an overscan region
     plotWin: function () {
-      return (this.mode2d && this._overWin) ? this._overWin : this.win;
+      return this.win;
     },
-    ensureOverscan: function (force) {
-      if (!this.mode2d) { this._overWin = null; return false; }
-      var w = this.win, o = this._overWin;
-      var xr = w.xmax - w.xmin, yr = w.ymax - w.ymin;
-      var need = force || !o ||
-        w.xmin < o.xmin + xr * 0.1 || w.xmax > o.xmax - xr * 0.1 ||
-        w.ymin < o.ymin + yr * 0.1 || w.ymax > o.ymax - yr * 0.1 ||
-        xr > (o.xmax - o.xmin) / 1.4;
-      if (!need) { o.visYr = yr; return false; }
-      var xc = (w.xmin + w.xmax) / 2, yc = (w.ymin + w.ymax) / 2, F = 2.5;
-      var nw = {
-        xmin: xc - xr * F / 2, xmax: xc + xr * F / 2,
-        ymin: yc - yr * F / 2, ymax: yc + yr * F / 2,
-        zmin: w.zmin, zmax: w.zmax
-      };
-      nw.diag = Math.hypot(nw.xmax - nw.xmin, nw.ymax - nw.ymin, nw.zmax - nw.zmin);
-      nw.visYr = yr;
-      this._overWin = nw;
-      return true;
-    },
-    // coarse refill when a gesture runs off the precomputed region (throttled)
-    refill2dSoon: function () {
+    // 2D interaction (wheel/pan) just mutates the window, then asks for a
+    // resample. Cost is bounded by screen resolution, not the world zoom level,
+    // so this runs live at any zoom. Coalesced to one rebuild per animation
+    // frame; camera + geometry + grid are refreshed together so the curve is
+    // always pinned exactly to the grid (it never lags or drifts).
+    rebuild2dSoon: function () {
       var self = this;
-      if (this._refillRAF) return;
-      var now = performance.now();
-      if (this._lastRefill && now - this._lastRefill < 130) return; // settle catches up
-      this._refillRAF = requestAnimationFrame(function () {
-        self._refillRAF = null;
-        self._lastRefill = performance.now();
-        self._fastMode = true;
-        var t0 = performance.now();
-        self.viewport.plotWin2d = self._overWin;
-        self.viewport.rebuildDecor();
+      if (this._raf2d) return;
+      this._raf2d = requestAnimationFrame(function () {
+        self._raf2d = null;
+        self.viewport.update2dCamera();
         self.buildAllGeom();
-        self._lastFastMs = performance.now() - t0;
+        self.viewport.rebuildDecor();
       });
+    },
+    // cancel any queued 2D rebuild (e.g. on a switch back to 3D)
+    resetGestures2d: function () {
+      if (this._raf2d) { cancelAnimationFrame(this._raf2d); this._raf2d = null; }
+      clearTimeout(this._wheelTimer); this._wheelTimer = null;
+      clearTimeout(this._panTimer); this._panTimer = null;
+      this._fastMode = false;
     },
 
     // during continuous interaction (slider drag / play), rebuild coarse and
@@ -527,10 +512,13 @@
       return null;
     },
 
-    // sample a solved xy-plane form as polylines over the plot window,
-    // splitting at undefined points and bisecting to domain boundaries
+    // Sample a solved xy-plane form as polylines, once per screen column across
+    // the VISIBLE window (Desmos-style): the sample count is bounded by screen
+    // resolution, not the zoom level, so this stays fast at any zoom and the
+    // curve is pinned exactly to the grid. Runs of samples break at undefined
+    // points and at asymptote-sized jumps.
     planarPolylines: function (spec, env, pw) {
-      var map = null, a = 0, b = 1;
+      var map = null, a = 0, b = 1, param = false;
       try {
         if (spec.type === 'graph' && spec.axis === 'y' && spec.mode === 'cart') {
           var fy = P.makeFn(spec.expr, ['x', 'z'], env);
@@ -542,7 +530,7 @@
           map = function (t) { return [fx(t, 0), t, 0]; };
         } else if (spec.type === 'cyl') {
           var fr = P.makeFn(spec.expr, ['theta', 'z'], env);
-          a = 0; b = 2 * Math.PI;
+          a = 0; b = 2 * Math.PI; param = true;
           map = function (t) { var r = fr(t, 0); return [r * Math.cos(t), r * Math.sin(t), 0]; };
         } else if (spec.type === 'thetaSurf' && spec.isConst) {
           var tc = P.evalConst(spec.expr, env);
@@ -553,88 +541,44 @@
       if (!map) return null;
 
       var xr = pw.xmax - pw.xmin, yr = pw.ymax - pw.ymin;
-      var xlo = pw.xmin - xr * 0.25, xhi = pw.xmax + xr * 0.25;
-      var ylo = pw.ymin - yr * 0.25, yhi = pw.ymax + yr * 0.25;
-      var good = function (p) {
-        return p && isFinite(p[0]) && isFinite(p[1]) &&
-          p[0] >= xlo && p[0] <= xhi && p[1] >= ylo && p[1] <= yhi;
+      // keep a window of margin so near-vertical parts run off-screen cleanly
+      var xlo = pw.xmin - xr, xhi = pw.xmax + xr;
+      var ylo = pw.ymin - yr, yhi = pw.ymax + yr;
+      var inView = function (p) {
+        return p[0] >= xlo && p[0] <= xhi && p[1] >= ylo && p[1] <= yhi;
       };
-      var sample = function (t) {
-        var p;
-        try { p = map(t); } catch (e) { p = null; }
-        return good(p) ? p : null;
-      };
-      var N = this._fastMode ? 250 : 700;
-      // deep bisection to the domain boundary, then log-spaced samples along
-      // the asymptote so tails curve down as far as double precision allows
-      var LADDER = 22;
-      var xr2 = xhi - xlo, yr2 = yhi - ylo;
-      // a tail still diverging at the deepest representable sample is a true
-      // asymptote: extend it straight to the clip edge (pixel-correct)
-      var snapEdge = function (arr, atStart) {
-        if (arr.length < 2) return;
-        var p0 = atStart ? arr[0] : arr[arr.length - 1];
-        var p1 = atStart ? arr[1] : arr[arr.length - 2];
-        var dx2 = p0[0] - p1[0], dy2 = p0[1] - p1[1];
-        var pt = null;
-        if (Math.abs(dy2) / yr2 > Math.abs(dx2) / xr2) {
-          if (Math.abs(dy2) > yr2 * 0.002) pt = [p0[0], dy2 < 0 ? ylo : yhi, 0];
-        } else if (Math.abs(dx2) > xr2 * 0.002) {
-          pt = [dx2 < 0 ? xlo : xhi, p0[1], 0];
-        }
-        if (pt) { if (atStart) arr.unshift(pt); else arr.push(pt); }
-      };
-      var ladder = function (edgeT, farT) {
-        var span = Math.abs(farT - edgeT);
-        if (!(span > 0)) return [];
-        var d0 = Math.max(span * 1e-14, 5e-324);
-        var dirn = farT > edgeT ? 1 : -1;
-        var pts2 = [];
-        for (var k = 0; k <= LADDER; k++) {
-          var off = k === 0 ? 0 : d0 * Math.pow(span / d0, k / LADDER);
-          var pp = sample(edgeT + dirn * off);
-          if (pp) pts2.push(pp);
-        }
-        return pts2;
-      };
-      var polys = [], cur = null, prevT = a, prevOk = null;
+      var W = 1200;
+      try { W = this.viewport.renderer.domElement.clientWidth || 1200; } catch (e) { }
+      // one sample per (fraction of a) screen pixel; closed polar curves get a
+      // fixed high count since they don't scan the x-axis
+      var N = param ? 720 : Math.max(400, Math.min(4000, Math.round(W * 1.5)));
+      var jump = param ? Infinity : Math.max(xr, yr) * 2; // asymptote-sized break
+      var polys = [], cur = null, prev = null;
       for (var i = 0; i <= N; i++) {
         var t = a + (b - a) * i / N;
-        var p = sample(t);
-        if (p && !prevOk && i > 0) {
-          // entering the domain
-          var lo = prevT, hi = t;
-          for (var it = 0; it < 600; it++) {
-            var mid = (lo + hi) / 2;
-            if (mid === lo || mid === hi) break;
-            if (sample(mid)) hi = mid; else lo = mid;
-          }
-          cur = ladder(hi, t);
-          snapEdge(cur, true);
+        var p;
+        try { p = map(t); } catch (e2) { p = null; }
+        var ok = p && isFinite(p[0]) && isFinite(p[1]);
+        if (ok && cur && prev &&
+            (Math.abs(p[0] - prev[0]) > jump || Math.abs(p[1] - prev[1]) > jump)) {
+          if (cur.length > 1) polys.push(cur);
+          cur = null; // discontinuity (asymptote): don't bridge it
         }
-        if (p) {
+        if (ok && inView(p)) {
           if (!cur) cur = [];
           cur.push(p);
-        } else if (prevOk) {
-          // leaving the domain
-          var lo2 = prevT, hi2 = t;
-          for (var it2 = 0; it2 < 600; it2++) {
-            var mid2 = (lo2 + hi2) / 2;
-            if (mid2 === lo2 || mid2 === hi2) break;
-            if (sample(mid2)) lo2 = mid2; else hi2 = mid2;
-          }
-          var down = ladder(lo2, prevT);
-          down.reverse();
-          cur = cur.concat(down);
-          snapEdge(cur, false);
-          if (cur.length > 1) polys.push(cur);
-          cur = null;
+          prev = p;
+        } else if (ok) {
+          // just outside: include one point so the line reaches the edge, then end
+          if (cur) { cur.push(p); if (cur.length > 1) polys.push(cur); cur = null; }
+          prev = p;
+        } else {
+          if (cur && cur.length > 1) polys.push(cur);
+          cur = null; prev = null;
         }
-        prevT = t;
-        prevOk = p;
       }
       if (cur && cur.length > 1) polys.push(cur);
-      return polys.length ? polys : [];
+      return polys;
     },
 
     meshGeometryFor: function (row) {
@@ -904,6 +848,22 @@
         if (fv === 'z') {
           var polys = this.planarPolylines(spec, env, win);
           if (polys) return G.flatRibbon(polys, 2, 0, win, style);
+          // unsolvable planar implicits/regions: contour the xy-plane slice
+          // directly instead of building and slicing a throwaway 3D mesh.
+          // F is z-independent here (fv === 'z'), so evaluate on the same
+          // z-clamped plane the old sliced-mesh path drew the trace on.
+          if (spec.type === 'implicit' || spec.type === 'region') {
+            // adaptive contour: refines only along the curve, so it stays smooth
+            // however small the feature is on screen (see G.marchingSquaresAdaptive)
+            var baseRes = s.res ? Math.max(64, Math.min(256, s.res * 2)) : 128;
+            var refine = 3;
+            if (this._fastMode) { baseRes = Math.min(baseRes, 80); refine = 2; }
+            var c0 = Math.max(win.zmin, Math.min(win.zmax, 0));
+            var Fxy = P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST });
+            var msPolys = G.marchingSquaresAdaptive(
+              function (x, y) { return Fxy(x, y, c0); }, win, baseRes, refine);
+            return G.flatRibbon(msPolys, 2, c0, win, style);
+          }
         }
         if (fv) {
           var hadFlat = s.flat2d, hadMode = this.mode2d;
@@ -1042,8 +1002,7 @@
     setWindow: function (w, skipRecompute) {
       w.diag = Math.hypot(w.xmax - w.xmin, w.ymax - w.ymin, w.zmax - w.zmin);
       this.win = w;
-      if (this.mode2d) this.ensureOverscan(false);
-      this.viewport.setWindow(w, this._overWin);
+      this.viewport.setWindow(w, null);
       if (this._winInputs) {
         for (var k in this._winInputs) this._winInputs[k].value = P.fmtNum(w[k]);
       }
@@ -1058,8 +1017,11 @@
       var w = this.win;
       var span = (w.xmax - w.xmin) * f;
       if (span < 1e-3 || span > 1e5) return;
-      var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2, cz = (w.zmin + w.zmax) / 2;
       var flat = this.mode2d;
+      // 3D zooms about the origin so the box stays centered on the axes; 2D
+      // zooms about the current view center
+      var cx = flat ? (w.xmin + w.xmax) / 2 : 0;
+      var cy = flat ? (w.ymin + w.ymax) / 2 : 0, cz = 0;
       if (!flat) this.viewport.scaleView(f);
       this.setWindow({
         xmin: cx + (w.xmin - cx) * f, xmax: cx + (w.xmax - cx) * f,
@@ -1070,21 +1032,13 @@
       this.flashWindowSize();
     },
 
-    // drag-pan in 2D: only the camera moves; content is already there
+    // drag-pan in 2D: move the window and resample for it (screen-bounded, live)
     pan2d: function (dx, dy) {
       var w = this.win;
       w.xmin += dx; w.xmax += dx; w.ymin += dy; w.ymax += dy;
       this.viewport.win = w;
-      this.viewport.update2dCamera();
-      if (this.ensureOverscan(false)) this.refill2dSoon();
-      var self = this;
-      clearTimeout(this._panTimer);
-      this._panTimer = setTimeout(function () {
-        self._panTimer = null;
-        self._fastMode = false;
-        self.ensureOverscan(true);
-        self.setWindow(self.win);
-      }, 250);
+      this.rebuild2dSoon();
+      this.saveSoon();
     },
 
     // in 2D the window must match the viewport shape so the grid is edge-to-edge
@@ -1095,7 +1049,12 @@
       var yr = w.ymax - w.ymin, xc = (w.xmin + w.xmax) / 2, xr = yr * aspect;
       w.xmin = xc - xr / 2;
       w.xmax = xc + xr / 2;
-      this.setWindow(w);
+      w.diag = Math.hypot(w.xmax - w.xmin, w.ymax - w.ymin, w.zmax - w.zmin);
+      this.win = w; this.viewport.win = w;
+      this.viewport.update2dCamera();
+      this.buildAllGeom();
+      this.viewport.rebuildDecor();
+      this.saveSoon();
     },
 
     // Gesture-speed window step: geometry only, at coarse resolution.
@@ -1104,8 +1063,10 @@
       var w = this.win;
       var span = (w.xmax - w.xmin) * f;
       if (span < 1e-3 || span > 1e5) return;
-      var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2, cz = (w.zmin + w.zmax) / 2;
       var flat = this.mode2d;
+      // 3D zooms about the origin; 2D about the current view center
+      var cx = flat ? (w.xmin + w.xmax) / 2 : 0;
+      var cy = flat ? (w.ymin + w.ymax) / 2 : 0, cz = 0;
       var nw = {
         xmin: cx + (w.xmin - cx) * f, xmax: cx + (w.xmax - cx) * f,
         ymin: cy + (w.ymin - cy) * f, ymax: cy + (w.ymax - cy) * f,
@@ -1132,21 +1093,15 @@
       if (this.mode2d) {
         var w = this.win;
         var span2 = (w.xmax - w.xmin) * f;
-        if (span2 < 1e-3 || span2 > 1e5) return;
+        if (span2 < 1e-3 || span2 > 1e7) return;
         var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2;
         w.xmin = cx + (w.xmin - cx) * f; w.xmax = cx + (w.xmax - cx) * f;
         w.ymin = cy + (w.ymin - cy) * f; w.ymax = cy + (w.ymax - cy) * f;
+        w.diag = Math.hypot(w.xmax - w.xmin, w.ymax - w.ymin, w.zmax - w.zmin);
         this.viewport.win = w;
-        this.viewport.update2dCamera();
         this.flashWindowSize();
-        if (this.ensureOverscan(false)) this.refill2dSoon();
-        clearTimeout(this._wheelTimer);
-        this._wheelTimer = setTimeout(function () {
-          self._wheelTimer = null;
-          self._fastMode = false;
-          self.ensureOverscan(true);
-          self.setWindow(self.win);
-        }, 220);
+        this.rebuild2dSoon(); // resample directly for the new window — pinned, no lag
+        this.saveSoon();
         return;
       }
       var acc = (this._wheelAccum || 1) * f;
@@ -1217,18 +1172,26 @@
       };
       syncDim();
       dim.addEventListener('click', function () {
+        // drop any in-flight 2D gesture work so a leaked refill/settle can't
+        // fire after the switch and rebuild the other view's scene coarse
+        self.resetGestures2d();
         self.mode2d = !self.mode2d;
         self.viewport.setMode2d(self.mode2d);
         syncDim();
-        if (self.mode2d) { self.ensureOverscan(true); self.applyAspect2d(); }
+        if (self.mode2d) self.applyAspect2d();
         else {
           // re-square the window: 2D stretched x to the viewport aspect
           self._overWin = null;
           var w2 = self.win;
-          var yr2 = w2.ymax - w2.ymin, xc2 = (w2.xmin + w2.xmax) / 2;
-          w2.xmin = xc2 - yr2 / 2;
-          w2.xmax = xc2 + yr2 / 2;
+          // 2D only tracks the z=0 plane, so return to 3D as a cube centered on
+          // the origin (at the current 2D zoom level) — the box frames the axes
+          // instead of drifting off wherever the 2D view was panned/zoomed
+          var r = (w2.ymax - w2.ymin) / 2;
+          w2.xmin = -r; w2.xmax = r;
+          w2.ymin = -r; w2.ymax = r;
+          w2.zmin = -r; w2.zmax = r;
           self.setWindow(w2);
+          self.viewport.home(); // reframe the 3D camera on the re-centered cube
         }
         self.saveSoon();
       });

@@ -582,6 +582,280 @@
     return mesh;
   };
 
+  /* --- marching-squares core, shared by the uniform and adaptive samplers --- */
+  function msLerp(xa, ya, fa, xb, yb, fb) {
+    var s = fa / (fa - fb);
+    return [xa + (xb - xa) * s, ya + (yb - ya) * s, 0];
+  }
+  // append raw zero-crossing segments of f over a uniform nx*ny grid on the
+  // rectangle [x0,x1]x[y0,y1] into `segs`. Crossings on a shared edge come from
+  // identical corner values, so segments from adjacent grids (including adjacent
+  // refined cells) chain together seamlessly.
+  function msCells(f, x0, x1, y0, y1, nx, ny, segs) {
+    var i, j;
+    var xs = new Float64Array(nx + 1), ys = new Float64Array(ny + 1);
+    for (i = 0; i <= nx; i++) xs[i] = x0 + (x1 - x0) * i / nx;
+    for (j = 0; j <= ny; j++) ys[j] = y0 + (y1 - y0) * j / ny;
+    var vals = new Float64Array((nx + 1) * (ny + 1));
+    for (j = 0; j <= ny; j++) {
+      for (i = 0; i <= nx; i++) {
+        var v;
+        try { v = f(xs[i], ys[j]); } catch (e) { v = NaN; }
+        vals[j * (nx + 1) + i] = isFinite(v) ? v : NaN;
+      }
+    }
+    for (j = 0; j < ny; j++) {
+      for (i = 0; i < nx; i++) {
+        var f00 = vals[j * (nx + 1) + i], f10 = vals[j * (nx + 1) + i + 1];
+        var f01 = vals[(j + 1) * (nx + 1) + i], f11 = vals[(j + 1) * (nx + 1) + i + 1];
+        if (isNaN(f00) || isNaN(f10) || isNaN(f01) || isNaN(f11)) continue;
+        var cx0 = xs[i], cx1 = xs[i + 1], cy0 = ys[j], cy1 = ys[j + 1];
+        var cross = [];
+        if ((f00 < 0) !== (f10 < 0)) cross.push(msLerp(cx0, cy0, f00, cx1, cy0, f10));
+        if ((f10 < 0) !== (f11 < 0)) cross.push(msLerp(cx1, cy0, f10, cx1, cy1, f11));
+        if ((f01 < 0) !== (f11 < 0)) cross.push(msLerp(cx0, cy1, f01, cx1, cy1, f11));
+        if ((f00 < 0) !== (f01 < 0)) cross.push(msLerp(cx0, cy0, f00, cx0, cy1, f01));
+        if (cross.length === 2) {
+          segs.push([cross[0], cross[1]]);
+        } else if (cross.length === 4) {
+          var fc;
+          try { fc = f((cx0 + cx1) / 2, (cy0 + cy1) / 2); } catch (e2) { fc = NaN; }
+          if (isFinite(fc) && (fc < 0) === (f00 < 0)) {
+            segs.push([cross[0], cross[1]]);
+            segs.push([cross[2], cross[3]]);
+          } else {
+            segs.push([cross[3], cross[0]]);
+            segs.push([cross[1], cross[2]]);
+          }
+        }
+      }
+    }
+  }
+  // chain raw segments into polylines by snapping coincident endpoints
+  function msChain(segs, q) {
+    if (!segs.length) return [];
+    var key = function (p) { return Math.round(p[0] / q) + ',' + Math.round(p[1] / q); };
+    var links = {};
+    segs.forEach(function (seg, si) {
+      [0, 1].forEach(function (end) {
+        var kk = key(seg[end]);
+        (links[kk] = links[kk] || []).push({ si: si, end: end });
+      });
+    });
+    var used = new Uint8Array(segs.length);
+    var polylines = [];
+    for (var si = 0; si < segs.length; si++) {
+      if (used[si]) continue;
+      used[si] = 1;
+      var line = [segs[si][0], segs[si][1]];
+      var extend = function (fromFront) {
+        for (;;) {
+          var tip = fromFront ? line[0] : line[line.length - 1];
+          var cands = links[key(tip)] || [];
+          var found = null;
+          for (var c = 0; c < cands.length; c++) {
+            if (!used[cands[c].si]) { found = cands[c]; break; }
+          }
+          if (!found) break;
+          used[found.si] = 1;
+          var nxt = segs[found.si][1 - found.end];
+          if (fromFront) line.unshift(nxt); else line.push(nxt);
+        }
+      };
+      extend(false); extend(true);
+      if (line.length > 1) polylines.push(line);
+    }
+    return polylines;
+  }
+
+  /* Adaptive marching squares (the quadtree idea Desmos-style plotters use): a
+   * coarse base grid locates the curve, then ONLY the cells it passes through
+   * are subdivided and re-sampled, so a small feature keeps fine detail however
+   * far you zoom out. Cost scales with curve length, not viewport area. baseRes
+   * finds the curve; effective resolution near it is baseRes * 2^refine. */
+  G.marchingSquaresAdaptive = function (f, win, baseRes, refine) {
+    var n = Math.max(8, baseRes || 128);
+    var x0 = win.xmin, x1 = win.xmax, y0 = win.ymin, y1 = win.ymax;
+    var bx = new Float64Array(n + 1), by = new Float64Array(n + 1), i, j;
+    for (i = 0; i <= n; i++) bx[i] = x0 + (x1 - x0) * i / n;
+    for (j = 0; j <= n; j++) by[j] = y0 + (y1 - y0) * j / n;
+    var bv = new Float64Array((n + 1) * (n + 1));
+    for (j = 0; j <= n; j++) {
+      for (i = 0; i <= n; i++) {
+        var v;
+        try { v = f(bx[i], by[j]); } catch (e) { v = NaN; }
+        bv[j * (n + 1) + i] = isFinite(v) ? v : NaN;
+      }
+    }
+    var active = [];
+    for (j = 0; j < n; j++) {
+      for (i = 0; i < n; i++) {
+        var g00 = bv[j * (n + 1) + i], g10 = bv[j * (n + 1) + i + 1];
+        var g01 = bv[(j + 1) * (n + 1) + i], g11 = bv[(j + 1) * (n + 1) + i + 1];
+        if (isNaN(g00) || isNaN(g10) || isNaN(g01) || isNaN(g11)) continue;
+        var neg = g00 < 0;
+        if ((g10 < 0) !== neg || (g01 < 0) !== neg || (g11 < 0) !== neg) active.push(j * n + i);
+      }
+    }
+    if (!active.length) return [];
+    var sub = 1 << Math.max(1, refine || 3);
+    var maxSub = Math.max(2, Math.floor(Math.sqrt(60000 / active.length)));
+    if (sub > maxSub) sub = maxSub;
+    var segs = [];
+    for (var a = 0; a < active.length; a++) {
+      var ci = active[a] % n, cj = (active[a] - ci) / n;
+      msCells(f, bx[ci], bx[ci + 1], by[cj], by[cj + 1], sub, sub, segs);
+    }
+    return msChain(segs, Math.max(x1 - x0, y1 - y0) / (n * sub) * 1e-3);
+  };
+
+  /* zero contour of f(x,y) over the window's xy-rectangle, as chained
+   * polylines of [x,y,0] points; cells with a non-finite corner are skipped */
+  G.marchingSquares = function (f, win, res) {
+    var n = Math.max(8, res || 96);
+    var xs = new Float64Array(n + 1), ys = new Float64Array(n + 1);
+    var i, j;
+    for (i = 0; i <= n; i++) {
+      xs[i] = win.xmin + (win.xmax - win.xmin) * i / n;
+      ys[i] = win.ymin + (win.ymax - win.ymin) * i / n;
+    }
+    var vals = new Float64Array((n + 1) * (n + 1));
+    for (j = 0; j <= n; j++) {
+      for (i = 0; i <= n; i++) {
+        var v;
+        try { v = f(xs[i], ys[j]); } catch (e) { v = NaN; }
+        vals[j * (n + 1) + i] = isFinite(v) ? v : NaN;
+      }
+    }
+    var lerp = function (xa, ya, fa, xb, yb, fb) {
+      var s = fa / (fa - fb);
+      return [xa + (xb - xa) * s, ya + (yb - ya) * s, 0];
+    };
+    var segs = [];
+    for (j = 0; j < n; j++) {
+      for (i = 0; i < n; i++) {
+        var f00 = vals[j * (n + 1) + i], f10 = vals[j * (n + 1) + i + 1];
+        var f01 = vals[(j + 1) * (n + 1) + i], f11 = vals[(j + 1) * (n + 1) + i + 1];
+        if (isNaN(f00) || isNaN(f10) || isNaN(f01) || isNaN(f11)) continue;
+        var x0 = xs[i], x1 = xs[i + 1], y0 = ys[j], y1 = ys[j + 1];
+        var cross = []; // edge order: bottom, right, top, left
+        if ((f00 < 0) !== (f10 < 0)) cross.push(lerp(x0, y0, f00, x1, y0, f10));
+        if ((f10 < 0) !== (f11 < 0)) cross.push(lerp(x1, y0, f10, x1, y1, f11));
+        if ((f01 < 0) !== (f11 < 0)) cross.push(lerp(x0, y1, f01, x1, y1, f11));
+        if ((f00 < 0) !== (f01 < 0)) cross.push(lerp(x0, y0, f00, x0, y1, f01));
+        if (cross.length === 2) {
+          segs.push([cross[0], cross[1]]);
+        } else if (cross.length === 4) {
+          // saddle: the center sample decides which diagonal connects
+          var fc;
+          try { fc = f((x0 + x1) / 2, (y0 + y1) / 2); } catch (e2) { fc = NaN; }
+          if (isFinite(fc) && (fc < 0) === (f00 < 0)) {
+            segs.push([cross[0], cross[1]]); // isolate the f10 corner
+            segs.push([cross[2], cross[3]]); // isolate the f01 corner
+          } else {
+            segs.push([cross[3], cross[0]]); // isolate the f00 corner
+            segs.push([cross[1], cross[2]]); // isolate the f11 corner
+          }
+        }
+      }
+    }
+    if (!segs.length) return [];
+    // chain segments into polylines via quantized endpoints (crossings on a
+    // shared cell edge are computed from the same corner values, so they match)
+    var q = Math.max(win.xmax - win.xmin, win.ymax - win.ymin) / n * 1e-3;
+    var key = function (p) { return Math.round(p[0] / q) + ',' + Math.round(p[1] / q); };
+    var links = {};
+    segs.forEach(function (seg, si) {
+      [0, 1].forEach(function (end) {
+        var kk = key(seg[end]);
+        (links[kk] = links[kk] || []).push({ si: si, end: end });
+      });
+    });
+    var used = new Uint8Array(segs.length);
+    var polylines = [];
+    for (var si = 0; si < segs.length; si++) {
+      if (used[si]) continue;
+      used[si] = 1;
+      var line = [segs[si][0], segs[si][1]];
+      var extend = function (fromFront) {
+        for (;;) {
+          var tip = fromFront ? line[0] : line[line.length - 1];
+          var cands = links[key(tip)] || [];
+          var found = null;
+          for (var c = 0; c < cands.length; c++) {
+            if (!used[cands[c].si]) { found = cands[c]; break; }
+          }
+          if (!found) break;
+          used[found.si] = 1;
+          var nxt = segs[found.si][1 - found.end];
+          if (fromFront) line.unshift(nxt); else line.push(nxt);
+        }
+      };
+      extend(false); extend(true);
+      if (line.length > 1) polylines.push(line);
+    }
+    return polylines;
+  };
+
+  /* Chaikin corner-cutting: turns a coarse contour into a smooth curve without
+   * any extra function evaluations, so grid-resolution facets stop reading as
+   * straight edges. Open polylines keep their endpoints; closed loops (first
+   * point == last) stay closed. Points move at most one edge-length inward, so
+   * the smoothed curve hugs the original. */
+  G.smoothContours = function (polylines, iters) {
+    iters = iters || 2;
+    return polylines.map(function (poly) {
+      if (poly.length < 3) return poly;
+      var n0 = poly.length;
+      var closed = n0 > 3 &&
+        Math.abs(poly[0][0] - poly[n0 - 1][0]) < 1e-9 &&
+        Math.abs(poly[0][1] - poly[n0 - 1][1]) < 1e-9;
+      var pts = closed ? poly.slice(0, n0 - 1) : poly.slice();
+      for (var it = 0; it < iters; it++) {
+        var out = [], n = pts.length, i, p, q;
+        if (!closed) out.push(pts[0]);
+        var last = closed ? n : n - 1;
+        for (i = 0; i < last; i++) {
+          p = pts[i]; q = pts[(i + 1) % n];
+          out.push([0.75 * p[0] + 0.25 * q[0], 0.75 * p[1] + 0.25 * q[1], 0]);
+          out.push([0.25 * p[0] + 0.75 * q[0], 0.25 * p[1] + 0.75 * q[1], 0]);
+        }
+        if (!closed) out.push(pts[n - 1]);
+        pts = out;
+      }
+      if (closed) pts.push([pts[0][0], pts[0][1], 0]);
+      return pts;
+    });
+  };
+
+  /* 2D overscan bookkeeping: content is computed over factor x the visible
+   * window so gestures can move only the camera. During a gesture (force
+   * falsy) a rebuild is needed only when the window nears the overscan edge
+   * or outgrows it; at settle (force truthy) it also recenters earlier and
+   * resamples after enough zoom-in that sample density has degraded. */
+  G.overscanNeed = function (w, o, force) {
+    if (!o) return true;
+    var xr = w.xmax - w.xmin, yr = w.ymax - w.ymin;
+    var ow = o.xmax - o.xmin;
+    var m = force ? 0.25 : 0.1;
+    return w.xmin < o.xmin + xr * m || w.xmax > o.xmax - xr * m ||
+      w.ymin < o.ymin + yr * m || w.ymax > o.ymax - yr * m ||
+      xr > ow / 1.4 ||
+      (!!force && xr < ow / (2.5 * 1.5));
+  };
+  G.overscanMake = function (w, F) {
+    var xr = w.xmax - w.xmin, yr = w.ymax - w.ymin;
+    var xc = (w.xmin + w.xmax) / 2, yc = (w.ymin + w.ymax) / 2;
+    var nw = {
+      xmin: xc - xr * F / 2, xmax: xc + xr * F / 2,
+      ymin: yc - yr * F / 2, ymax: yc + yr * F / 2,
+      zmin: w.zmin, zmax: w.zmax
+    };
+    nw.diag = Math.hypot(nw.xmax - nw.xmin, nw.ymax - nw.ymin, nw.zmax - nw.zmin);
+    nw.visYr = yr;
+    return nw;
+  };
+
   /* flat stroked line in the plane {axes[axIdx]=c0}: a thin unlit ribbon */
   G.flatRibbon = function (polylines, axIdx, c0, win, style) {
     // width relative to the VISIBLE vertical range: constant on-screen stroke

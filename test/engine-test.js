@@ -190,6 +190,118 @@
   ok(P.parse('\\operatorname{intersection}\\left(\\right)').kind === 'intersection', 'intersection() parses');
   ok(classifyLatex('\\operatorname{intersection}').type === 'intersect', 'intersection classifies');
 
+  /* ---------- 2D plotting helpers: marching squares + overscan ---------- */
+  var G2 = P.geom;
+  ok(G2 && typeof G2.marchingSquares === 'function', 'marchingSquares exists');
+  ok(G2 && typeof G2.overscanNeed === 'function', 'overscanNeed exists');
+  ok(G2 && typeof G2.overscanMake === 'function', 'overscanMake exists');
+  try {
+    var msWin = { xmin: -5, xmax: 5, ymin: -5, ymax: 5, zmin: -5, zmax: 5 };
+    var circ = G2.marchingSquares(function (x, y) { return x * x + y * y - 9; }, msWin, 64);
+    ok(circ.length >= 1, 'circle contour found');
+    var rOK = true, zOK = true, ptCount = 0;
+    circ.forEach(function (poly) {
+      poly.forEach(function (p) {
+        ptCount++;
+        if (Math.abs(Math.hypot(p[0], p[1]) - 3) > 0.05) rOK = false;
+        if (p[2] !== 0) zOK = false;
+      });
+    });
+    ok(rOK, 'circle contour points sit on radius 3');
+    ok(zOK, 'circle contour lives in z=0');
+    ok(ptCount > 40, 'circle contour densely sampled');
+    var main = circ.reduce(function (a2, b2) { return b2.length > a2.length ? b2 : a2; }, circ[0]);
+    var ms0 = main[0], ms1 = main[main.length - 1];
+    ok(Math.hypot(ms0[0] - ms1[0], ms0[1] - ms1[1]) < 0.5, 'circle contour chains closed');
+
+    var hyp = G2.marchingSquares(function (x, y) { return x * y - 1; },
+      { xmin: -3, xmax: 3, ymin: -3, ymax: 3 }, 96);
+    ok(hyp.length >= 2, 'hyperbola chains into separate branches');
+
+    var none = G2.marchingSquares(function (x, y) { return x * x + y * y + 1; }, msWin, 32);
+    ok(none.length === 0, 'positive-definite F has empty contour');
+
+    var nanC = G2.marchingSquares(function (x, y) { return Math.sqrt(x) - 1; }, msWin, 64);
+    var xOK = nanC.length > 0;
+    nanC.forEach(function (poly) {
+      poly.forEach(function (p) { if (Math.abs(p[0] - 1) > 0.05) xOK = false; });
+    });
+    ok(xOK, 'NaN cells skipped, sqrt(x)=1 contour at x=1');
+  } catch (e) { ok(false, 'marchingSquares suite threw', e.message); }
+  try {
+    ok(typeof G2.smoothContours === 'function', 'smoothContours exists');
+    // open polyline keeps its two endpoints exactly, and gains points
+    var openC = G2.smoothContours([[[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 1, 0]]], 2)[0];
+    ok(openC[0][0] === 0 && openC[0][1] === 0, 'smoothContours keeps the first endpoint');
+    ok(openC[openC.length - 1][0] === 2 && openC[openC.length - 1][1] === 1, 'smoothContours keeps the last endpoint');
+    ok(openC.length > 4, 'smoothContours subdivides');
+    // a closed loop stays closed
+    var sq = [[1, 1, 0], [-1, 1, 0], [-1, -1, 0], [1, -1, 0], [1, 1, 0]];
+    var cl = G2.smoothContours([sq], 2)[0];
+    ok(Math.abs(cl[0][0] - cl[cl.length - 1][0]) < 1e-9 && Math.abs(cl[0][1] - cl[cl.length - 1][1]) < 1e-9, 'smoothContours keeps a loop closed');
+    var within = true;
+    cl.forEach(function (p) { if (Math.abs(p[0]) > 1.0001 || Math.abs(p[1]) > 1.0001) within = false; });
+    ok(within, 'chaikin points stay inside the control polygon');
+    // 2-point lines are left untouched
+    ok(G2.smoothContours([[[0, 0, 0], [1, 1, 0]]], 2)[0].length === 2, 'smoothContours leaves 2-point lines');
+    // a coarse 12-gon on radius 3 smooths to points that hug the circle
+    var circ = [];
+    for (var ci = 0; ci <= 12; ci++) { var th = ci / 12 * 2 * Math.PI; circ.push([3 * Math.cos(th), 3 * Math.sin(th), 0]); }
+    var sc = G2.smoothContours([circ], 2)[0];
+    var rok = true;
+    sc.forEach(function (p) { var r = Math.hypot(p[0], p[1]); if (r > 3.001 || r < 2.85) rok = false; });
+    ok(rok, 'chaikin-smoothed 12-gon stays near radius 3');
+    ok(sc.length > circ.length, 'smoothed loop is denser than the 12-gon');
+  } catch (e) { ok(false, 'smoothContours suite threw', e.message); }
+  try {
+    ok(typeof G2.marchingSquaresAdaptive === 'function', 'marchingSquaresAdaptive exists');
+    // a small circle in a large window: uniform grid gives a coarse polygon,
+    // adaptive refines along the curve and stays smooth
+    var bigWin = { xmin: -150, xmax: 150, ymin: -150, ymax: 150, zmin: -1, zmax: 1 };
+    var Fc = function (x, y) { return x * x + y * y - 9; };
+    var uni = G2.marchingSquares(Fc, bigWin, 128);
+    var adp = G2.marchingSquaresAdaptive(Fc, bigWin, 128, 3);
+    var uniPts = uni.reduce(function (s, p) { return s + p.length; }, 0);
+    var adpPts = adp.reduce(function (s, p) { return s + p.length; }, 0);
+    ok(adp.length >= 1, 'adaptive finds the small circle');
+    ok(adpPts > uniPts * 3, 'adaptive samples the tiny circle far denser than uniform');
+    ok(adpPts > 30, 'adaptive circle is finely sampled even when tiny in the window');
+    var adpROK = true, adpZOK = true;
+    adp.forEach(function (poly) {
+      poly.forEach(function (p) {
+        if (Math.abs(Math.hypot(p[0], p[1]) - 3) > 0.1) adpROK = false;
+        if (p[2] !== 0) adpZOK = false;
+      });
+    });
+    ok(adpROK, 'adaptive circle points sit on radius 3');
+    ok(adpZOK, 'adaptive contour stays in z=0');
+    var amain = adp.reduce(function (a2, b2) { return b2.length > a2.length ? b2 : a2; }, adp[0]);
+    ok(Math.hypot(amain[0][0] - amain[amain.length - 1][0], amain[0][1] - amain[amain.length - 1][1]) < 1,
+      'adaptive circle chains into a closed loop');
+    ok(G2.marchingSquaresAdaptive(function (x, y) { return x * x + y * y + 1; }, bigWin, 64, 2).length === 0,
+      'adaptive: positive-definite F has no contour');
+  } catch (e) { ok(false, 'marchingSquaresAdaptive suite threw', e.message); }
+  try {
+    var vw = { xmin: -2, xmax: 2, ymin: -1, ymax: 1, zmin: -1, zmax: 1 };
+    var ov = G2.overscanMake(vw, 2.5);
+    approx(ov.xmax - ov.xmin, 10, 'overscan spans 2.5x the window');
+    approx(ov.visYr, 2, 'overscan records visible y-range');
+    ok(G2.overscanNeed(vw, null, false), 'missing overscan always needs a build');
+    ok(!G2.overscanNeed(vw, ov, false), 'fresh overscan rides the gesture');
+    ok(!G2.overscanNeed(vw, ov, true), 'fresh overscan skips the settle rebuild');
+    var panMed = { xmin: 0.4, xmax: 4.4, ymin: -1, ymax: 1, zmin: -1, zmax: 1 };
+    ok(!G2.overscanNeed(panMed, ov, false), 'medium pan stays inside gesture margin');
+    ok(G2.overscanNeed(panMed, ov, true), 'settle recenters after a medium pan');
+    var panDeep = { xmin: 0.8, xmax: 4.8, ymin: -1, ymax: 1, zmin: -1, zmax: 1 };
+    ok(G2.overscanNeed(panDeep, ov, false), 'deep pan escapes mid-gesture');
+    var zoomOut = { xmin: -3.8, xmax: 3.8, ymin: -1.9, ymax: 1.9, zmin: -1, zmax: 1 };
+    ok(G2.overscanNeed(zoomOut, ov, false), 'zoom-out 1.9x escapes the overscan');
+    var zin14 = { xmin: -2 / 1.4, xmax: 2 / 1.4, ymin: -1 / 1.4, ymax: 1 / 1.4, zmin: -1, zmax: 1 };
+    ok(!G2.overscanNeed(zin14, ov, true), 'settle after 1.4x zoom-in reuses geometry');
+    var zin16 = { xmin: -2 / 1.6, xmax: 2 / 1.6, ymin: -1 / 1.6, ymax: 1 / 1.6, zmin: -1, zmax: 1 };
+    ok(G2.overscanNeed(zin16, ov, true), 'settle after 1.6x zoom-in resamples');
+  } catch (e) { ok(false, 'overscan suite threw', e.message); }
+
   print('PASS ' + passed + '  FAIL ' + failed);
   failures.forEach(function (f2) { print('  FAILED: ' + f2); });
   if (failed > 0) imports.system.exit(1);
