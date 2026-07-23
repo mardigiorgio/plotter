@@ -43,7 +43,7 @@
     sumStartsWithNEquals: true,
     charsThatBreakOutOfSupSub: '+-=<>',
     autoCommands: 'pi theta rho phi tau sqrt nthroot',
-    autoOperatorNames: 'sin cos tan sec csc cot arcsin arccos arctan asin acos atan sinh cosh tanh asinh acosh atanh ln log exp abs min max floor ceil round sign mod vector intersection'
+    autoOperatorNames: 'sin cos tan sec csc cot arcsin arccos arctan asin acos atan sinh cosh tanh asinh acosh atanh ln log exp abs min max floor ceil round sign mod vector intersection region'
   };
 
   /* =============================== Row =============================== */
@@ -54,6 +54,9 @@
     this.app = app;
     this.id = 'row' + (nextId++);
     state = state || {};
+    // saved rows carry an explicit opacity; only fresh rows may be given the
+    // translucent region default later (classifyRow)
+    this._opacityExplicit = state.opacity !== undefined;
     this.state = {
       latex: state.latex || '',
       hidden: !!state.hidden,
@@ -66,6 +69,7 @@
       domains: state.domains || {}, // {t0,t1,u0,u1,v0,v1} strings
       slider: state.slider || { min: '-10', max: '10', step: '' },
       isect: state.isect || null,  // {a: rowIndex, b: rowIndex} (persistence only)
+      regionBounds: state.regionBounds || ['', '', ''], // 3 inequality strings for a region object
       flat2d: !!state.flat2d       // draw the flat trace instead of the extruded sheet
     };
     this._isectA = null; // live row references, resolved by the app
@@ -352,6 +356,28 @@
       mk('and', selB, 'b');
     },
 
+    /* -------- region bound fields (one inequality per axis) -------- */
+    showRegionBounds: function (bounds, onChange) {
+      var self = this;
+      this.clearSub();
+      var wrap = el('div', 'rgnstrip', this.substrip);
+      var holders = ['-2 < x < 2', '-2 < y < 2', 'x^2+y^2 < z < 4'];
+      bounds = bounds || ['', '', ''];
+      [0, 1, 2].forEach(function (i) {
+        var box = el('span', 'rgnb', wrap);
+        var inp = el('input', 'rgnin', box);
+        inp.value = bounds[i] || '';
+        inp.placeholder = holders[i];
+        inp.spellcheck = false;
+        inp.addEventListener('change', function () {
+          var arr = (self.state.regionBounds || ['', '', '']).slice();
+          arr[i] = inp.value;
+          self.state.regionBounds = arr;
+          onChange();
+        });
+      });
+    },
+
     getDomain: function (name, defLo, defHi) {
       var d = this.state.domains;
       var lo = defLo, hi = defHi;
@@ -462,6 +488,9 @@
         domains: this.state.domains, slider: this.state.slider,
         flat2d: this.state.flat2d
       };
+      if (this.state.regionBounds && this.state.regionBounds.some(function (b) { return b; })) {
+        out.regionBounds = this.state.regionBounds;
+      }
       if (this._isectA || this._isectB) {
         out.isect = {
           a: this._isectA ? this.app.rows.indexOf(this._isectA) : null,

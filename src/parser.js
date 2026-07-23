@@ -162,6 +162,19 @@
       if (t === '=' || t === '<' || t === '>' || t === '<=' || t === '>=') {
         this.next();
         var rhs = this.parseExpr();
+        // chained inequality: a < b < c …  (not for '='). Yields a 'chain' node.
+        var t2 = this.peek().t;
+        if (t !== '=' && (t2 === '<' || t2 === '>' || t2 === '<=' || t2 === '>=')) {
+          var terms = [lhs, rhs], ops = [t];
+          while (t2 === '<' || t2 === '>' || t2 === '<=' || t2 === '>=') {
+            this.next();
+            terms.push(this.parseExpr());
+            ops.push(t2);
+            t2 = this.peek().t;
+          }
+          if (!this.at('eof')) err('unexpected input after inequality');
+          return { kind: 'chain', terms: terms, ops: ops };
+        }
         if (!this.at('eof')) err('unexpected input after expression');
         return { kind: 'rel', op: t, lhs: lhs, rhs: rhs };
       }
@@ -417,6 +430,10 @@
     // bare "intersection" (optionally with empty parens) is its own statement kind
     if (/^\s*\\operatorname\{intersection\}\s*(\\left\(\s*\\right\)|\(\s*\))?\s*$/.test(latex)) {
       return { kind: 'intersection' };
+    }
+    // bare "region" likewise: its inequality bounds live in the row's substrip
+    if (/^\s*\\operatorname\{region\}\s*(\\left\(\s*\\right\)|\(\s*\))?\s*$/.test(latex)) {
+      return { kind: 'region' };
     }
     var toks = tokenize(preprocess(latex));
     var p = new Parser(toks);

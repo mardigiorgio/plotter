@@ -30,6 +30,50 @@
     return mat;
   }
 
+  /* Two-pass surface: ONE geometry drawn twice — BackSide first, FrontSide
+   * second — so a translucent solid composites its own two layers in a fixed
+   * order from every angle (no within-mesh speckle). scene.js sortTransparent
+   * re-sorts the pairs of all rows by camera distance each rendered frame.
+   * The back pass is slightly darker so interiors read as interiors. */
+  var rimHook = function (shader) {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <emissivemap_fragment>',
+      '#include <emissivemap_fragment>\n' +
+      '\ttotalEmissiveRadiance += vec3(0.07) * pow(1.0 - abs(dot(normalize(vViewPosition), normal)), 3.0);');
+  };
+  function surfacePair(geo, style) {
+    var mk = function (side) {
+      var m = new THREE.MeshPhongMaterial({
+        color: style.color, side: side,
+        transparent: style.opacity < 1, opacity: style.opacity,
+        shininess: 45, specular: 0x222222,
+        depthWrite: style.opacity >= 0.99,
+        polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
+      });
+      m._styleOpacity = true;
+      return m;
+    };
+    var back = new THREE.Mesh(geo, mk(THREE.BackSide));
+    back.material.color.multiplyScalar(0.86);
+    var front = new THREE.Mesh(geo, mk(THREE.FrontSide));
+    front.material.onBeforeCompile = rimHook; // gentle fresnel rim: curvature reads
+    back._transRole = 0; front._transRole = 1;
+    var g = new THREE.Group();
+    g._transPair = [back, front];
+    g.add(back, front);
+    return g;
+  }
+  G.surfacePair = surfacePair;
+
+  // BufferGeometry from the mesher's plain arrays
+  function meshGeo(m) {
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(m.pos), 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(m.nrm), 3));
+    geo.setIndex(m.idx);
+    return geo;
+  }
+
   /* ---------- generic parametric grid surface ---------- */
   // fn(u,v) → [x,y,z]; invalid (non-finite / far outside) vertices break the mesh there.
   // Window handling: vertices moderately outside the box are clamped onto its
@@ -51,86 +95,166 @@
     return state;
   };
 
-  G.paramSurface = function (fn, u0, u1, v0, v1, nu, nv, win, style) {
-    var nverts = (nu + 1) * (nv + 1);
-    var pos = new Float32Array(nverts * 3);
-    var valid = new Uint8Array(nverts);   // 1 = usable
-    var clamped = new Uint8Array(nverts); // 1 = pressed onto a wall
-    var i, j, k = 0;
+  // classify a point against the box WITHOUT mutating it:
+  // 0 = strictly inside, 1 = within half a range of a wall, 2 = far beyond.
+  G.clampState = function (p, win) {
+    var mn = [win.xmin, win.ymin, win.zmin], mx = [win.xmax, win.ymax, win.zmax];
+    var st = 0;
+    for (var ax = 0; ax < 3; ax++) {
+      var lo = mn[ax], hi = mx[ax], far = (hi - lo) * 0.5, v = p[ax];
+      if (v < lo - far || v > hi + far) return 2;
+      if (v < lo || v > hi) st = 1;
+    }
+    return st;
+  };
 
+  // Sutherland–Hodgman clip of a convex ring against the 6 box faces. Each ring
+  // vertex is {p:[x,y,z], n:[x,y,z]} (n carried so the cut edge stays smoothly
+  // shaded). Returns a fan-triangulable ring, or [] if fully outside.
+  G.clipToBox = function (ring, win) {
+    var faces = [
+      [0, 1, win.xmin], [0, -1, win.xmax],
+      [1, 1, win.ymin], [1, -1, win.ymax],
+      [2, 1, win.zmin], [2, -1, win.zmax]
+    ];
+    for (var f = 0; f < 6 && ring.length; f++) {
+      var ax = faces[f][0], sgn = faces[f][1], val = faces[f][2];
+      var out = [], n = ring.length;
+      for (var i = 0; i < n; i++) {
+        var A = ring[i], B = ring[(i + 1) % n];
+        var da = (A.p[ax] - val) * sgn, db = (B.p[ax] - val) * sgn; // >= 0 is inside
+        if (da >= 0) out.push(A);
+        if ((da >= 0) !== (db >= 0)) {
+          var t = da / (da - db);
+          out.push({
+            p: [A.p[0] + (B.p[0] - A.p[0]) * t, A.p[1] + (B.p[1] - A.p[1]) * t, A.p[2] + (B.p[2] - A.p[2]) * t],
+            n: [A.n[0] + (B.n[0] - A.n[0]) * t, A.n[1] + (B.n[1] - A.n[1]) * t, A.n[2] + (B.n[2] - A.n[2]) * t]
+          });
+        }
+      }
+      ring = out;
+    }
+    return ring;
+  };
+
+  // Sample a parametric surface into a mesh that reaches the box faces cleanly.
+  // Vertices keep their TRUE positions; interior triangles stay indexed (shared,
+  // smoothly shaded), boundary triangles are CLIPPED to the box so asymptote
+  // walls (ln, 1/x, tan) end on a crisp intersection edge instead of a smeared
+  // ledge. Triangles that span an asymptote (a huge jump across one grid cell)
+  // are dropped so the two branches never bridge — the 3D analogue of the 2D
+  // planar sampler's pole splitting.
+  G.paramSurface = function (fn, u0, u1, v0, v1, nu, nv, win, style) {
+    var W = nu + 1, np = W * (nv + 1);
+    var vx = new Float64Array(np * 3);
+    var fin = new Uint8Array(np);   // finite sample
+    var ins = new Uint8Array(np);   // finite AND strictly inside the box
+    var i, j, k = 0;
     for (j = 0; j <= nv; j++) {
       var vv = v0 + (v1 - v0) * j / nv;
       for (i = 0; i <= nu; i++, k++) {
-        var uu = u0 + (u1 - u0) * i / nu;
-        var p;
+        var uu = u0 + (u1 - u0) * i / nu, p;
         try { p = fn(uu, vv); } catch (e) { p = null; }
         if (!p || !isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) continue;
-        var st = G.clampBox(p, win);
-        if (st === 2) continue;
-        if (st === 1) clamped[k] = 1;
-        pos[k * 3] = p[0]; pos[k * 3 + 1] = p[1]; pos[k * 3 + 2] = p[2];
-        valid[k] = 1;
+        vx[k * 3] = p[0]; vx[k * 3 + 1] = p[1]; vx[k * 3 + 2] = p[2];
+        fin[k] = 1;
+        ins[k] = G.clampState(p, win) === 0 ? 1 : 0;
       }
     }
-    // Domain-edge refinement: an unusable vertex next to a usable one is
-    // snapped to the last usable parameter (found by bisection), so surfaces
-    // with asymptotes or domain boundaries (ln, 1/x, sqrt) reach the box
-    // instead of stopping at the nearest grid column.
-    var usable = function (uu, vv, out) {
-      var p;
-      try { p = fn(uu, vv); } catch (e) { return false; }
-      if (!p || !isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) return false;
-      var st = G.clampBox(p, win);
-      if (st === 2) return false;
-      out.p = p;
-      out.cl = st === 1;
-      return true;
+    // per-vertex normals from finite neighbours (central differences)
+    var nrm = new Float32Array(np * 3);
+    var vp = function (kk, c) { return vx[kk * 3 + c]; };
+    for (j = 0; j <= nv; j++) for (i = 0; i <= nu; i++) {
+      k = j * W + i;
+      if (!fin[k]) continue;
+      var iu = (i < nu && fin[k + 1]) ? k + 1 : k, il = (i > 0 && fin[k - 1]) ? k - 1 : k;
+      var ju = (j < nv && fin[k + W]) ? k + W : k, jl = (j > 0 && fin[k - W]) ? k - W : k;
+      var ax2 = vp(iu, 0) - vp(il, 0), ay = vp(iu, 1) - vp(il, 1), az = vp(iu, 2) - vp(il, 2);
+      var bx = vp(ju, 0) - vp(jl, 0), by = vp(ju, 1) - vp(jl, 1), bz = vp(ju, 2) - vp(jl, 2);
+      var nx = ay * bz - az * by, ny = az * bx - ax2 * bz, nz = ax2 * by - ay * bx;
+      var nl = Math.hypot(nx, ny, nz) || 1;
+      nrm[k * 3] = nx / nl; nrm[k * 3 + 1] = ny / nl; nrm[k * 3 + 2] = nz / nl;
+    }
+    // surface normal at any parameter (finite differences of fn)
+    var hu = (u1 - u0) / nu * 0.02, hv = (v1 - v0) / nv * 0.02;
+    var normalAt = function (uu, vv) {
+      var a1, a0, b1, b0;
+      try { a1 = fn(uu + hu, vv); a0 = fn(uu - hu, vv); b1 = fn(uu, vv + hv); b0 = fn(uu, vv - hv); } catch (e) { }
+      if (!a1 || !a0 || !b1 || !b0) return [0, 0, 1];
+      var ex = a1[0] - a0[0], ey = a1[1] - a0[1], ez = a1[2] - a0[2];
+      var gx = b1[0] - b0[0], gy = b1[1] - b0[1], gz = b1[2] - b0[2];
+      var nx = ey * gz - ez * gy, ny = ez * gx - ex * gz, nz = ex * gy - ey * gx;
+      var nl = Math.hypot(nx, ny, nz);
+      return nl ? [nx / nl, ny / nl, nz / nl] : [0, 0, 1];
     };
-    var valid0 = valid.slice();
-    var out = {};
-    var refine = nu > 24 && nv > 24; // skip during coarse gesture rebuilds
-    for (j = 0; refine && j <= nv; j++) {
-      for (i = 0; i <= nu; i++) {
-        k = j * (nu + 1) + i;
-        if (valid0[k]) continue;
-        var ni = -1, nj = -1;
-        if (i > 0 && valid0[k - 1]) { ni = i - 1; nj = j; }
-        else if (i < nu && valid0[k + 1]) { ni = i + 1; nj = j; }
-        else if (j > 0 && valid0[k - (nu + 1)]) { ni = i; nj = j - 1; }
-        else if (j < nv && valid0[k + (nu + 1)]) { ni = i; nj = j + 1; }
-        if (ni === -1) continue;
-        var au = u0 + (u1 - u0) * ni / nu, av = v0 + (v1 - v0) * nj / nv; // usable end
-        var bu = u0 + (u1 - u0) * i / nu, bv = v0 + (v1 - v0) * j / nv;  // unusable end
-        for (var it = 0; it < 18; it++) {
-          var mu = (au + bu) / 2, mv = (av + bv) / 2;
-          if (usable(mu, mv, out)) { au = mu; av = mv; }
-          else { bu = mu; bv = mv; }
-        }
-        if (usable(au, av, out)) {
-          pos[k * 3] = out.p[0]; pos[k * 3 + 1] = out.p[1]; pos[k * 3 + 2] = out.p[2];
-          valid[k] = 1;
-          clamped[k] = out.cl ? 1 : 0;
-        }
+    // Walk a cell edge from an INSIDE parameter toward a not-inside one and
+    // return the last point still inside the box (bisection) — the exact spot
+    // where an asymptote wall meets the box face, or where the domain ends.
+    // Done PER CELL EDGE, so each side of a pole reaches the face on its own; a
+    // single shared grid vertex could only ever be pulled toward one branch.
+    var crossing = function (iu, iv, ou, ov) {
+      var au = iu, av = iv, bu = ou, bv = ov, best = null;
+      for (var it = 0; it < 32; it++) {
+        var mu = (au + bu) / 2, mv = (av + bv) / 2, q;
+        try { q = fn(mu, mv); } catch (e) { q = null; }
+        if (q && isFinite(q[0]) && isFinite(q[1]) && isFinite(q[2]) && G.clampState(q, win) === 0) { au = mu; av = mv; best = q; }
+        else { bu = mu; bv = mv; }
       }
+      return best ? { p: best, n: normalAt(au, av) } : null;
+    };
+    // assemble
+    var pos = [], nor = [], idx = [];
+    for (k = 0; k < np; k++) {
+      pos.push(vx[k * 3], vx[k * 3 + 1], vx[k * 3 + 2]);
+      nor.push(nrm[k * 3], nrm[k * 3 + 1], nrm[k * 3 + 2]);
     }
-
-    var indices = [];
-    for (j = 0; j < nv; j++) {
-      for (i = 0; i < nu; i++) {
-        var a = j * (nu + 1) + i, b = a + 1, c = a + nu + 1, d = c + 1;
-        if (valid[a] && valid[b] && valid[c] && valid[d] &&
-            (clamped[a] + clamped[b] + clamped[c] + clamped[d] < 4)) {
-          indices.push(a, b, d, a, d, c);
+    var far = [(win.xmax - win.xmin) * 3, (win.ymax - win.ymin) * 3, (win.zmax - win.zmin) * 3];
+    var spans = function (poly) { // guard: a patch reaching > 3 ranges would bridge an asymptote
+      for (var ax = 0; ax < 3; ax++) {
+        var lo = Infinity, hi = -Infinity;
+        for (var q = 0; q < poly.length; q++) { var vv = poly[q].p[ax]; if (vv < lo) lo = vv; if (vv > hi) hi = vv; }
+        if (hi - lo > far[ax]) return true;
+      }
+      return false;
+    };
+    var gridV = function (kk) { return { p: [vx[kk * 3], vx[kk * 3 + 1], vx[kk * 3 + 2]], n: [nrm[kk * 3], nrm[kk * 3 + 1], nrm[kk * 3 + 2]] }; };
+    var pushV = function (v) { pos.push(v.p[0], v.p[1], v.p[2]); nor.push(v.n[0], v.n[1], v.n[2]); return pos.length / 3 - 1; };
+    var uAt = function (ii) { return u0 + (u1 - u0) * ii / nu; };
+    var vAt = function (jj) { return v0 + (v1 - v0) * jj / nv; };
+    // Marching-squares over the "strictly inside the box" corner field: fully
+    // interior cells stay indexed (smooth, shared); a cell straddling the box
+    // face or a domain edge is cut to the inside polygon, its cut vertices found
+    // by per-edge bisection so asymptote walls reach the faces cleanly and each
+    // branch of a pole is built on its own side.
+    for (j = 0; j < nv; j++) for (i = 0; i < nu; i++) {
+      var cA = j * W + i, cB = cA + 1, cC = cA + W, cD = cC + 1;
+      if (ins[cA] && ins[cB] && ins[cC] && ins[cD]) { idx.push(cA, cB, cD, cA, cD, cC); continue; }
+      if (!(ins[cA] || ins[cB] || ins[cC] || ins[cD])) continue; // nothing inside this cell
+      var ring = [
+        { k: cA, i: i, j: j }, { k: cB, i: i + 1, j: j },
+        { k: cD, i: i + 1, j: j + 1 }, { k: cC, i: i, j: j + 1 }
+      ];
+      var poly = [];
+      for (var e = 0; e < 4; e++) {
+        var An = ring[e], Bn = ring[(e + 1) % 4];
+        var ai = ins[An.k], bi = ins[Bn.k];
+        if (ai) poly.push(gridV(An.k));
+        if (ai !== bi) {
+          var In = ai ? An : Bn, Out = ai ? Bn : An;
+          var cr = crossing(uAt(In.i), vAt(In.j), uAt(Out.i), vAt(Out.j));
+          if (cr) poly.push(cr);
         }
       }
+      if (poly.length < 3 || spans(poly)) continue;
+      var ids = poly.map(pushV);
+      for (var t = 1; t + 1 < ids.length; t++) idx.push(ids[0], ids[t], ids[t + 1]);
     }
     var geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setIndex(indices);
-    geo.computeVertexNormals();
-    var mesh = new THREE.Mesh(geo, surfaceMaterial(style));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(nor), 3));
+    geo.setIndex(idx);
     var group = new THREE.Group();
-    group.add(mesh);
+    group.add(surfacePair(geo, style));
     if (style.mesh) group.add(G.gridLines(fn, u0, u1, v0, v1, win, nu <= 24 || nv <= 24));
     return group;
   };
@@ -164,8 +288,10 @@
     }
     var geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
-    var mat = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18 });
-    return new THREE.LineSegments(geo, mat);
+    var mat = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18, depthWrite: false });
+    var lines = new THREE.LineSegments(geo, mat);
+    lines.renderOrder = 500; // after the translucent surface passes
+    return lines;
   };
 
   /* ---------- spec-specific surface builders ---------- */
@@ -186,6 +312,11 @@
     var n = res || 64;
     return G.paramSurface(function (th, z) {
       var r = fn(th, z);
+      // r is a radius: negative values are outside the coordinate's domain.
+      // Mapping them through anyway would reflect the point across the origin
+      // and draw a ghost sheet. Invalid instead — the sampler ends the
+      // surface cleanly on the r = 0 boundary.
+      if (!(r >= 0)) return null;
       return [r * Math.cos(th), r * Math.sin(th), z];
     }, 0, 2 * Math.PI, win.zmin, win.zmax, n, n, win, style);
   };
@@ -203,6 +334,9 @@
     var n = res || 64;
     return G.paramSurface(function (ph, th) {
       var rho = fn(ph, th);
+      // rho >= 0 by definition; negative values would reflect through the
+      // origin and double-cover the surface (z-fighting ghost sheet)
+      if (!(rho >= 0)) return null;
       var sp = Math.sin(ph);
       return [rho * sp * Math.cos(th), rho * sp * Math.sin(th), rho * Math.cos(ph)];
     }, 0, Math.PI, 0, 2 * Math.PI, n, n, win, style);
@@ -213,6 +347,9 @@
     var rmax = win.diag * 0.6;
     return G.paramSurface(function (s, th) {
       var ph = fn(s, th);
+      // phi is the angle from +z, defined on [0, pi]; values outside flip
+      // sin(phi) negative, which is the same reflected-ghost trap as r < 0
+      if (!(ph >= 0 && ph <= Math.PI)) return null;
       var sp = Math.sin(ph);
       return [s * sp * Math.cos(th), s * sp * Math.sin(th), s * Math.cos(ph)];
     }, 0, rmax, 0, 2 * Math.PI, n, n, win, style);
@@ -420,253 +557,128 @@
     return group;
   };
 
-  /* ---------- implicit surfaces & regions: marching tetrahedra ---------- */
-  // F(x,y,z) compiled; returns BufferGeometry of F = 0 within window (pad cells for regions).
-  G.marchingTetra = function (F, win, N, pad) {
-    N = N || 40;
-    var padCells = pad ? 1 : 0;
-    var nx = N + 1 + 2 * padCells;
-    var hx = (win.xmax - win.xmin) / N, hy = (win.ymax - win.ymin) / N, hz = (win.zmax - win.zmin) / N;
-    var x0 = win.xmin - padCells * hx, y0 = win.ymin - padCells * hy, z0 = win.zmin - padCells * hz;
-    var vals = new Float32Array(nx * nx * nx);
-    var i, j, k, idx = 0;
-    for (k = 0; k < nx; k++) {
-      var z = z0 + k * hz;
-      for (j = 0; j < nx; j++) {
-        var y = y0 + j * hy;
-        for (i = 0; i < nx; i++, idx++) {
-          var v;
-          try { v = F(x0 + i * hx, y, z); } catch (e) { v = NaN; }
-          vals[idx] = v;
-        }
-      }
+  /* ---------- implicit surfaces & region solids (mesher.js core) ---------- */
+  function niceStepG(range) {
+    var raw = range / 6;
+    var pow = Math.pow(10, Math.floor(Math.log10(raw)));
+    var cands = [1, 2, 5, 10];
+    for (var i = 0; i < cands.length; i++) {
+      if (cands[i] * pow >= raw - 1e-12) return cands[i] * pow;
     }
-    function at(i2, j2, k2) { return vals[(k2 * nx + j2) * nx + i2]; }
-
-    var positions = [];
-    // cube corner offsets
-    var CO = [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]];
-    var TETS = [[0,1,2,6],[0,2,3,6],[0,3,7,6],[0,7,4,6],[0,4,5,6],[0,5,1,6]];
-    var cp = new Float64Array(24), cv = new Float64Array(8);
-
-    function interp(a, b) {
-      var va = cv[a], vb = cv[b];
-      var t = va / (va - vb);
-      if (!isFinite(t)) t = 0.5;
-      t = Math.max(0, Math.min(1, t));
-      positions.push(
-        cp[a * 3] + (cp[b * 3] - cp[a * 3]) * t,
-        cp[a * 3 + 1] + (cp[b * 3 + 1] - cp[a * 3 + 1]) * t,
-        cp[a * 3 + 2] + (cp[b * 3 + 2] - cp[a * 3 + 2]) * t);
-    }
-    function tri(a1, b1, a2, b2, a3, b3) { interp(a1, b1); interp(a2, b2); interp(a3, b3); }
-
-    for (k = 0; k < nx - 1; k++) {
-      for (j = 0; j < nx - 1; j++) {
-        for (i = 0; i < nx - 1; i++) {
-          var m, bad = false, allNeg = true, allPos = true;
-          for (m = 0; m < 8; m++) {
-            var vv = at(i + CO[m][0], j + CO[m][1], k + CO[m][2]);
-            if (!isFinite(vv)) { bad = true; break; }
-            cv[m] = vv;
-            if (vv < 0) allPos = false; else allNeg = false;
-          }
-          if (bad || allNeg || allPos) continue;
-          for (m = 0; m < 8; m++) {
-            cp[m * 3] = x0 + (i + CO[m][0]) * hx;
-            cp[m * 3 + 1] = y0 + (j + CO[m][1]) * hy;
-            cp[m * 3 + 2] = z0 + (k + CO[m][2]) * hz;
-          }
-          for (var tIdx = 0; tIdx < 6; tIdx++) {
-            var T = TETS[tIdx];
-            var a = T[0], b = T[1], c = T[2], d = T[3];
-            var code = (cv[a] < 0 ? 1 : 0) | (cv[b] < 0 ? 2 : 0) | (cv[c] < 0 ? 4 : 0) | (cv[d] < 0 ? 8 : 0);
-            switch (code) {
-              case 0: case 15: break;
-              case 1: case 14: tri(a, b, a, c, a, d); break;
-              case 2: case 13: tri(b, a, b, c, b, d); break;
-              case 4: case 11: tri(c, a, c, b, c, d); break;
-              case 8: case 7: tri(d, a, d, b, d, c); break;
-              case 3: case 12: // a,b vs c,d
-                tri(a, c, a, d, b, d); tri(a, c, b, d, b, c); break;
-              case 5: case 10: // a,c vs b,d
-                tri(a, b, a, d, c, d); tri(a, b, c, d, c, b); break;
-              case 9: case 6: // a,d vs b,c
-                tri(a, b, d, b, d, c); tri(a, b, d, c, a, c); break;
-            }
-          }
-        }
-      }
-    }
-
-    var n = positions.length / 3;
-    var posArr = new Float32Array(positions);
-    var normArr = new Float32Array(positions.length);
-    var eps = Math.min(hx, hy, hz) * 0.5;
-    // gradient at lattice node via central differences of the sampled field
-    var nodeGrad = function (i2, j2, k2, out2) {
-      var ia = i2 > 0 ? i2 - 1 : i2, ib = i2 < nx - 1 ? i2 + 1 : i2;
-      var ja = j2 > 0 ? j2 - 1 : j2, jb = j2 < nx - 1 ? j2 + 1 : j2;
-      var ka = k2 > 0 ? k2 - 1 : k2, kb = k2 < nx - 1 ? k2 + 1 : k2;
-      var vxa = at(ia, j2, k2), vxb = at(ib, j2, k2);
-      var vya = at(i2, ja, k2), vyb = at(i2, jb, k2);
-      var vza = at(i2, j2, ka), vzb = at(i2, j2, kb);
-      if (!isFinite(vxa) || !isFinite(vxb) || !isFinite(vya) || !isFinite(vyb) ||
-          !isFinite(vza) || !isFinite(vzb)) return false;
-      out2[0] = (vxb - vxa) / ((ib - ia) * hx);
-      out2[1] = (vyb - vya) / ((jb - ja) * hy);
-      out2[2] = (vzb - vza) / ((kb - ka) * hz);
-      return true;
-    };
-    var cg = [0, 0, 0];
-    for (var vI = 0; vI < n; vI++) {
-      var px = posArr[vI * 3], py = posArr[vI * 3 + 1], pz = posArr[vI * 3 + 2];
-      var gx = 0, gy = 0, gz = 0;
-      // trilinear blend of the 8 surrounding lattice-node gradients (no F calls)
-      var fx2 = (px - x0) / hx, fy2 = (py - y0) / hy, fz2 = (pz - z0) / hz;
-      var i0g = Math.max(0, Math.min(nx - 2, Math.floor(fx2)));
-      var j0g = Math.max(0, Math.min(nx - 2, Math.floor(fy2)));
-      var k0g = Math.max(0, Math.min(nx - 2, Math.floor(fz2)));
-      var tx = Math.max(0, Math.min(1, fx2 - i0g));
-      var ty = Math.max(0, Math.min(1, fy2 - j0g));
-      var tz = Math.max(0, Math.min(1, fz2 - k0g));
-      var okAll = true;
-      for (var c8 = 0; c8 < 8 && okAll; c8++) {
-        var di = c8 & 1, dj = (c8 >> 1) & 1, dk = (c8 >> 2) & 1;
-        var w8 = (di ? tx : 1 - tx) * (dj ? ty : 1 - ty) * (dk ? tz : 1 - tz);
-        if (w8 === 0) continue;
-        if (!nodeGrad(i0g + di, j0g + dj, k0g + dk, cg)) { okAll = false; break; }
-        gx += w8 * cg[0]; gy += w8 * cg[1]; gz += w8 * cg[2];
-      }
-      if (!okAll) {
-        // rare: field undefined nearby; fall back to direct evaluation
-        try {
-          gx = F(px + eps, py, pz) - F(px - eps, py, pz);
-          gy = F(px, py + eps, pz) - F(px, py - eps, pz);
-          gz = F(px, py, pz + eps) - F(px, py, pz - eps);
-        } catch (e) { gx = gy = gz = NaN; }
-      }
-      var gl = Math.sqrt(gx * gx + gy * gy + gz * gz);
-      if (!isFinite(gl) || gl === 0) { gx = 0; gy = 0; gz = 1; gl = 1; }
-      normArr[vI * 3] = gx / gl; normArr[vI * 3 + 1] = gy / gl; normArr[vI * 3 + 2] = gz / gl;
-    }
-    // consistent winding: face normal must agree with the field gradient,
-    // otherwise DoubleSide shading flips normals on half the triangles (speckle)
-    for (var tI = 0; tI + 8 < posArr.length; tI += 9) {
-      var e1x = posArr[tI + 3] - posArr[tI], e1y = posArr[tI + 4] - posArr[tI + 1], e1z = posArr[tI + 5] - posArr[tI + 2];
-      var e2x = posArr[tI + 6] - posArr[tI], e2y = posArr[tI + 7] - posArr[tI + 1], e2z = posArr[tI + 8] - posArr[tI + 2];
-      var fnx = e1y * e2z - e1z * e2y, fny = e1z * e2x - e1x * e2z, fnz = e1x * e2y - e1y * e2x;
-      var gsx = normArr[tI] + normArr[tI + 3] + normArr[tI + 6];
-      var gsy = normArr[tI + 1] + normArr[tI + 4] + normArr[tI + 7];
-      var gsz = normArr[tI + 2] + normArr[tI + 5] + normArr[tI + 8];
-      if (fnx * gsx + fny * gsy + fnz * gsz < 0) {
-        for (var sw = 0; sw < 3; sw++) {
-          var tmp = posArr[tI + 3 + sw]; posArr[tI + 3 + sw] = posArr[tI + 6 + sw]; posArr[tI + 6 + sw] = tmp;
-          tmp = normArr[tI + 3 + sw]; normArr[tI + 3 + sw] = normArr[tI + 6 + sw]; normArr[tI + 6 + sw] = tmp;
+    return 10 * pow;
+  }
+  /* z-elevation contour lines on a mesher output — the clean replacement for
+   * the old triangle-soup wireframe overlay on implicit surfaces */
+  G.isoLines = function (m, win) {
+    var step = niceStepG(win.zmax - win.zmin);
+    var levels = [];
+    for (var c = Math.ceil(win.zmin / step) * step; c <= win.zmax + 1e-9; c += step) levels.push(c);
+    var pts = [];
+    var pos = m.pos, idx = m.idx;
+    for (var t = 0; t < idx.length; t += 3) {
+      var A = idx[t] * 3, B = idx[t + 1] * 3, C = idx[t + 2] * 3;
+      var z0 = pos[A + 2], z1 = pos[B + 2], z2 = pos[C + 2];
+      var lo = Math.min(z0, z1, z2), hi = Math.max(z0, z1, z2);
+      if (lo === hi) continue;
+      for (var li = 0; li < levels.length; li++) {
+        var cz = levels[li];
+        if (cz < lo || cz > hi) continue;
+        var cut = [];
+        var edge = function (ia, ib, za, zb) {
+          if ((za < cz) === (zb < cz)) return;
+          var s = (cz - za) / (zb - za);
+          if (!isFinite(s)) return;
+          cut.push([pos[ia] + (pos[ib] - pos[ia]) * s,
+                    pos[ia + 1] + (pos[ib + 1] - pos[ia + 1]) * s, cz]);
+        };
+        edge(A, B, z0, z1); edge(B, C, z1, z2); edge(C, A, z2, z0);
+        if (cut.length === 2) {
+          pts.push(cut[0][0], cut[0][1], cut[0][2], cut[1][0], cut[1][1], cut[1][2]);
         }
       }
     }
     var geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-    geo.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
-    return geo;
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
+    var mat = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.15, depthWrite: false });
+    var lines = new THREE.LineSegments(geo, mat);
+    lines.renderOrder = 500;
+    return lines;
   };
 
-  G.implicit = function (F, win, style, res) {
-    var geo = G.marchingTetra(F, win, res || 44, false);
-    var mesh = new THREE.Mesh(geo, surfaceMaterial(style));
-    if (style.mesh) {
-      var wf = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x000000, wireframe: true, transparent: true, opacity: 0.08 }));
-      var grp = new THREE.Group(); grp.add(mesh, wf); return grp;
-    }
-    return mesh;
+  G.implicit = function (F, win, style, res, fast) {
+    var m = P.mesher.polygonize(F, win, res || 48, { refine: !fast, gradF: !fast });
+    var grp = new THREE.Group();
+    grp.add(surfacePair(meshGeo(m), style));
+    if (style.mesh && !fast) grp.add(G.isoLines(m, win));
+    return grp;
   };
 
-  /* --- marching-squares core, shared by the uniform and adaptive samplers --- */
-  function msLerp(xa, ya, fa, xb, yb, fb) {
-    var s = fa / (fa - fb);
-    return [xa + (xb - xa) * s, ya + (yb - ya) * s, 0];
-  }
-  // append raw zero-crossing segments of f over a uniform nx*ny grid on the
-  // rectangle [x0,x1]x[y0,y1] into `segs`. Crossings on a shared edge come from
-  // identical corner values, so segments from adjacent grids (including adjacent
-  // refined cells) chain together seamlessly.
-  function msCells(f, x0, x1, y0, y1, nx, ny, segs) {
-    var i, j;
-    var xs = new Float64Array(nx + 1), ys = new Float64Array(ny + 1);
-    for (i = 0; i <= nx; i++) xs[i] = x0 + (x1 - x0) * i / nx;
-    for (j = 0; j <= ny; j++) ys[j] = y0 + (y1 - y0) * j / ny;
-    var vals = new Float64Array((nx + 1) * (ny + 1));
-    for (j = 0; j <= ny; j++) {
-      for (i = 0; i <= nx; i++) {
-        var v;
-        try { v = f(xs[i], ys[j]); } catch (e) { v = NaN; }
-        vals[j * (nx + 1) + i] = isFinite(v) ? v : NaN;
-      }
-    }
-    for (j = 0; j < ny; j++) {
-      for (i = 0; i < nx; i++) {
-        var f00 = vals[j * (nx + 1) + i], f10 = vals[j * (nx + 1) + i + 1];
-        var f01 = vals[(j + 1) * (nx + 1) + i], f11 = vals[(j + 1) * (nx + 1) + i + 1];
-        if (isNaN(f00) || isNaN(f10) || isNaN(f01) || isNaN(f11)) continue;
-        var cx0 = xs[i], cx1 = xs[i + 1], cy0 = ys[j], cy1 = ys[j + 1];
-        var cross = [];
-        if ((f00 < 0) !== (f10 < 0)) cross.push(msLerp(cx0, cy0, f00, cx1, cy0, f10));
-        if ((f10 < 0) !== (f11 < 0)) cross.push(msLerp(cx1, cy0, f10, cx1, cy1, f11));
-        if ((f01 < 0) !== (f11 < 0)) cross.push(msLerp(cx0, cy1, f01, cx1, cy1, f11));
-        if ((f00 < 0) !== (f01 < 0)) cross.push(msLerp(cx0, cy0, f00, cx0, cy1, f01));
-        if (cross.length === 2) {
-          segs.push([cross[0], cross[1]]);
-        } else if (cross.length === 4) {
-          var fc;
-          try { fc = f((cx0 + cx1) / 2, (cy0 + cy1) / 2); } catch (e2) { fc = NaN; }
-          if (isFinite(fc) && (fc < 0) === (f00 < 0)) {
-            segs.push([cross[0], cross[1]]);
-            segs.push([cross[2], cross[3]]);
-          } else {
-            segs.push([cross[3], cross[0]]);
-            segs.push([cross[1], cross[2]]);
-          }
-        }
-      }
-    }
-  }
-  // chain raw segments into polylines by snapping coincident endpoints
-  function msChain(segs, q) {
-    if (!segs.length) return [];
-    var key = function (p) { return Math.round(p[0] / q) + ',' + Math.round(p[1] / q); };
-    var links = {};
-    segs.forEach(function (seg, si) {
-      [0, 1].forEach(function (end) {
-        var kk = key(seg[end]);
-        (links[kk] = links[kk] || []).push({ si: si, end: end });
-      });
-    });
-    var used = new Uint8Array(segs.length);
-    var polylines = [];
-    for (var si = 0; si < segs.length; si++) {
-      if (used[si]) continue;
-      used[si] = 1;
-      var line = [segs[si][0], segs[si][1]];
-      var extend = function (fromFront) {
-        for (;;) {
-          var tip = fromFront ? line[0] : line[line.length - 1];
-          var cands = links[key(tip)] || [];
-          var found = null;
-          for (var c = 0; c < cands.length; c++) {
-            if (!used[cands[c].si]) { found = cands[c]; break; }
-          }
-          if (!found) break;
-          used[found.si] = 1;
-          var nxt = segs[found.si][1 - found.end];
-          if (fromFront) line.unshift(nxt); else line.push(nxt);
-        }
+  /* Region solid: the raw field is marched over exactly the window (never
+   * max()-ed with the walls), then the box faces get analytic caps that reuse
+   * the surface's refined crossings — flat caps, crisp seams. parts (the
+   * individual constraint fields behind a chained/region3 max) give each side
+   * of an interior crease its own smooth normals. */
+  G.region = function (F, win, style, res, parts, fast) {
+    var N = res || 44;
+    // A constraint that coincides exactly with a window face (z < 4 in a ±4
+    // window) samples as F = 0 there — neither inside nor crossed, so the face
+    // would neither cap nor mesh. Evaluating through a hair-inward shrink of
+    // space about the window center lands boundary samples just inside the
+    // solid; the ~1e-6 relative shift of the isosurface is far below a pixel.
+    var kk = 1 - 1e-6;
+    var cx = (win.xmin + win.xmax) / 2, cy = (win.ymin + win.ymax) / 2, cz = (win.zmin + win.zmax) / 2;
+    var wrap = function (fn) {
+      return function (x, y, z) {
+        return fn(cx + (x - cx) * kk, cy + (y - cy) * kk, cz + (z - cz) * kk);
       };
-      extend(false); extend(true);
-      if (line.length > 1) polylines.push(line);
+    };
+    var m = P.mesher.polygonize(wrap(F), win, N, {
+      refine: !fast, gradF: !fast, parts: parts ? parts.map(wrap) : null
+    });
+    var caps = P.mesher.buildCaps(win, N, m.cache);
+    var grp = new THREE.Group();
+    // curved surface FIRST: meshGeometryFor / the 2D slicer must find it, not caps
+    if (m.idx.length) grp.add(surfacePair(meshGeo(m), style));
+    if (caps.idx.length) grp.add(surfacePair(meshGeo(caps), style));
+    if (style.mesh && !fast && m.idx.length) grp.add(G.isoLines(m, win));
+    return grp;
+  };
+
+  /* 2D inequality: translucent fill + boundary stroke (dashed when strict).
+   * Fill and stroke come from the same sampling, so they coincide exactly. */
+  G.regionFill2D = function (f, win, style, baseRes, refine, strict, c0) {
+    var r = P.mesher.fillRegion2D(f, win, baseRes, refine);
+    var grp = new THREE.Group();
+    var vy = win.visYr || (win.ymax - win.ymin);
+    if (r.idx.length) {
+      var geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(r.pos), 3));
+      geo.setIndex(r.idx);
+      var op = style.opacity !== undefined ? style.opacity : 1;
+      var mat = new THREE.MeshBasicMaterial({
+        color: style.color, transparent: true, opacity: op * 0.25, depthWrite: false,
+        side: THREE.DoubleSide // flat fills must not vanish seen from below in 3D
+      });
+      mat._styleOpacity = true;
+      mat._opacityMul = 0.25; // applyOpacityLive keeps the fill/stroke ratio
+      var fillMesh = new THREE.Mesh(geo, mat);
+      fillMesh.position.z = c0 || 0;
+      fillMesh.renderOrder = 1;
+      grp.add(fillMesh);
     }
-    return polylines;
-  }
+    var polys = r.contours;
+    if (strict) polys = P.mesher.dashPolylines(polys, vy * 0.014, vy * 0.009);
+    if (polys.length) {
+      var ribbon = G.flatRibbon(polys, 2, c0 || 0, win, style);
+      ribbon.renderOrder = 2;
+      grp.add(ribbon);
+    }
+    return grp;
+  };
+
+  /* marching-squares core lives in mesher.js (THREE-free, gjs-tested) */
+  var msCells = P.mesher.msCells;
+  var msChain = P.mesher.chainSegs;
 
   /* Adaptive marching squares (the quadtree idea Desmos-style plotters use): a
    * coarse base grid locates the curve, then ONLY the cells it passes through
@@ -713,88 +725,9 @@
    * polylines of [x,y,0] points; cells with a non-finite corner are skipped */
   G.marchingSquares = function (f, win, res) {
     var n = Math.max(8, res || 96);
-    var xs = new Float64Array(n + 1), ys = new Float64Array(n + 1);
-    var i, j;
-    for (i = 0; i <= n; i++) {
-      xs[i] = win.xmin + (win.xmax - win.xmin) * i / n;
-      ys[i] = win.ymin + (win.ymax - win.ymin) * i / n;
-    }
-    var vals = new Float64Array((n + 1) * (n + 1));
-    for (j = 0; j <= n; j++) {
-      for (i = 0; i <= n; i++) {
-        var v;
-        try { v = f(xs[i], ys[j]); } catch (e) { v = NaN; }
-        vals[j * (n + 1) + i] = isFinite(v) ? v : NaN;
-      }
-    }
-    var lerp = function (xa, ya, fa, xb, yb, fb) {
-      var s = fa / (fa - fb);
-      return [xa + (xb - xa) * s, ya + (yb - ya) * s, 0];
-    };
     var segs = [];
-    for (j = 0; j < n; j++) {
-      for (i = 0; i < n; i++) {
-        var f00 = vals[j * (n + 1) + i], f10 = vals[j * (n + 1) + i + 1];
-        var f01 = vals[(j + 1) * (n + 1) + i], f11 = vals[(j + 1) * (n + 1) + i + 1];
-        if (isNaN(f00) || isNaN(f10) || isNaN(f01) || isNaN(f11)) continue;
-        var x0 = xs[i], x1 = xs[i + 1], y0 = ys[j], y1 = ys[j + 1];
-        var cross = []; // edge order: bottom, right, top, left
-        if ((f00 < 0) !== (f10 < 0)) cross.push(lerp(x0, y0, f00, x1, y0, f10));
-        if ((f10 < 0) !== (f11 < 0)) cross.push(lerp(x1, y0, f10, x1, y1, f11));
-        if ((f01 < 0) !== (f11 < 0)) cross.push(lerp(x0, y1, f01, x1, y1, f11));
-        if ((f00 < 0) !== (f01 < 0)) cross.push(lerp(x0, y0, f00, x0, y1, f01));
-        if (cross.length === 2) {
-          segs.push([cross[0], cross[1]]);
-        } else if (cross.length === 4) {
-          // saddle: the center sample decides which diagonal connects
-          var fc;
-          try { fc = f((x0 + x1) / 2, (y0 + y1) / 2); } catch (e2) { fc = NaN; }
-          if (isFinite(fc) && (fc < 0) === (f00 < 0)) {
-            segs.push([cross[0], cross[1]]); // isolate the f10 corner
-            segs.push([cross[2], cross[3]]); // isolate the f01 corner
-          } else {
-            segs.push([cross[3], cross[0]]); // isolate the f00 corner
-            segs.push([cross[1], cross[2]]); // isolate the f11 corner
-          }
-        }
-      }
-    }
-    if (!segs.length) return [];
-    // chain segments into polylines via quantized endpoints (crossings on a
-    // shared cell edge are computed from the same corner values, so they match)
-    var q = Math.max(win.xmax - win.xmin, win.ymax - win.ymin) / n * 1e-3;
-    var key = function (p) { return Math.round(p[0] / q) + ',' + Math.round(p[1] / q); };
-    var links = {};
-    segs.forEach(function (seg, si) {
-      [0, 1].forEach(function (end) {
-        var kk = key(seg[end]);
-        (links[kk] = links[kk] || []).push({ si: si, end: end });
-      });
-    });
-    var used = new Uint8Array(segs.length);
-    var polylines = [];
-    for (var si = 0; si < segs.length; si++) {
-      if (used[si]) continue;
-      used[si] = 1;
-      var line = [segs[si][0], segs[si][1]];
-      var extend = function (fromFront) {
-        for (;;) {
-          var tip = fromFront ? line[0] : line[line.length - 1];
-          var cands = links[key(tip)] || [];
-          var found = null;
-          for (var c = 0; c < cands.length; c++) {
-            if (!used[cands[c].si]) { found = cands[c]; break; }
-          }
-          if (!found) break;
-          used[found.si] = 1;
-          var nxt = segs[found.si][1 - found.end];
-          if (fromFront) line.unshift(nxt); else line.push(nxt);
-        }
-      };
-      extend(false); extend(true);
-      if (line.length > 1) polylines.push(line);
-    }
-    return polylines;
+    msCells(f, win.xmin, win.xmax, win.ymin, win.ymax, n, n, segs);
+    return msChain(segs, Math.max(win.xmax - win.xmin, win.ymax - win.ymin) / n * 1e-3);
   };
 
   /* Chaikin corner-cutting: turns a coarse contour into a smooth curve without
@@ -856,6 +789,148 @@
     return nw;
   };
 
+  /* ---------- planar (xy-plane) curve sampler ----------
+   * Samples a map t↦[x,y,0] over t∈[a,b] into window-clipped polylines with
+   * correct vertical asymptotes: domain-edge tails (ln, log) and poles (1/x,
+   * tan) are carried straight out to the screen edge, and a pole splits the
+   * curve into separate branches instead of being bridged by a fake riser.
+   * Cost is bounded by N (≈ one sample per screen column) plus a little
+   * bisection per asymptote, so it stays live at any zoom. opts: {N, param}.
+   * param=true (closed polar curves) disables pole splitting, which would
+   * misfire on legitimate axis crossings. */
+  G.planarSample = function (map, a, b, win, opts) {
+    opts = opts || {};
+    var N = Math.max(2, Math.round(opts.N || 700));
+    var xr = win.xmax - win.xmin, yr = win.ymax - win.ymin;
+    // clip box: a quarter-window of margin so near-vertical parts run off
+    // cleanly and tails can be snapped just past the visible edge
+    var xlo = win.xmin - xr * 0.25, xhi = win.xmax + xr * 0.25;
+    var ylo = win.ymin - yr * 0.25, yhi = win.ymax + yr * 0.25;
+    var xr2 = xhi - xlo, yr2 = yhi - ylo;
+    var yCap = Math.max(Math.abs(yhi), Math.abs(ylo));
+
+    var raw = function (t) { var p; try { p = map(t); } catch (e) { p = null; } return p; };
+    var good = function (p) {
+      return !!p && isFinite(p[0]) && isFinite(p[1]) &&
+        p[0] >= xlo && p[0] <= xhi && p[1] >= ylo && p[1] <= yhi;
+    };
+    var sample = function (t) { var p = raw(t); return good(p) ? p : null; };
+
+    // Odd pole between two in-box samples of opposite sign: 1/y crosses zero
+    // there. Returns the pole parameter, or NaN if |y| stays bounded (a mere
+    // steep-but-finite crossing, not an asymptote).
+    var yOf = function (t) { var p = raw(t); return p ? p[1] : NaN; };
+    var findPole = function (t0, y0, t1) {
+      var lo = t0, hi = t1, gLo = 1 / y0;
+      for (var it = 0; it < 60; it++) {
+        var m = (lo + hi) / 2;
+        if (m === lo || m === hi) break;
+        var gm = 1 / yOf(m);
+        if (!isFinite(gm)) { hi = m; continue; }        // landed on the pole
+        if ((gm < 0) === (gLo < 0)) { lo = m; gLo = gm; } else { hi = m; }
+      }
+      var tp = (lo + hi) / 2, near = raw(tp);
+      if (near && isFinite(near[1]) && Math.abs(near[1]) < yCap * 4) return NaN;
+      return tp;
+    };
+
+    // sample stream: base grid, with a null injected at any hidden pole
+    var ts = [], ps = [];
+    var prevT = a, prevP = sample(a);
+    ts.push(a); ps.push(prevP);
+    for (var i = 1; i <= N; i++) {
+      var t = a + (b - a) * i / N;
+      var p = sample(t);
+      if (!opts.param && p && prevP && (prevP[1] < 0) !== (p[1] < 0)) {
+        var dy = Math.abs(p[1] - prevP[1]) / (yr || 1);
+        var dx = Math.abs(p[0] - prevP[0]) / (xr || 1);
+        if (dy > 0.05 && dy > dx * 6) {
+          var tp = findPole(prevT, prevP[1], t);
+          if (tp === tp) { ts.push(tp); ps.push(null); }  // tp===tp ⇒ not NaN
+        }
+      }
+      ts.push(t); ps.push(p);
+      prevT = t; prevP = p;
+    }
+
+    // The ladder bottoms out near double precision (|y| ≈ ln|Δx|), which falls
+    // far short of the clip edge once the window is large. If the tail is still
+    // DIVERGING there — |y| growing as we approach the boundary — it is a true
+    // asymptote, so extend it straight to the edge (pixel-correct). A finite
+    // domain edge (sqrt) instead CONVERGES (|y| shrinks toward the boundary),
+    // so its tail is left to end naturally. The test is scale-independent: it
+    // compares the two outermost samples, never an absolute fraction of the
+    // window, so it fires identically at every zoom level.
+    var snapEdge = function (arr, atStart) {
+      if (arr.length < 2) return;
+      var q0 = atStart ? arr[0] : arr[arr.length - 1];       // outermost sample
+      var q1 = atStart ? arr[1] : arr[arr.length - 2];       // one step inward
+      var dx2 = q0[0] - q1[0], dy2 = q0[1] - q1[1];
+      var eps = 1e-9;
+      var pt = null;
+      if (Math.abs(dy2) / yr2 > Math.abs(dx2) / xr2) {
+        if (Math.abs(q0[1]) > Math.abs(q1[1]) + yr2 * eps) pt = [q0[0], dy2 < 0 ? ylo : yhi, 0];
+      } else if (Math.abs(q0[0]) > Math.abs(q1[0]) + xr2 * eps) {
+        pt = [dx2 < 0 ? xlo : xhi, q0[1], 0];
+      }
+      if (pt) { if (atStart) arr.unshift(pt); else arr.push(pt); }
+    };
+    // converge on the domain/box boundary between a good t and a null t
+    var boundary = function (goodT, badT) {
+      for (var it = 0; it < 90; it++) {
+        var m = (goodT + badT) / 2;
+        if (m === goodT || m === badT) break;
+        if (sample(m)) goodT = m; else badT = m;
+      }
+      return badT;
+    };
+    // log-spaced samples from the boundary edgeT outward toward farT, so the
+    // tail curves down as far as double precision allows before snapEdge
+    var LADDER = 22;
+    var ladder = function (edgeT, farT) {
+      var span = Math.abs(farT - edgeT);
+      if (!(span > 0)) return [];
+      var d0 = Math.max(span * 1e-14, 5e-324);
+      var dirn = farT > edgeT ? 1 : -1;
+      var out = [];
+      for (var k = 0; k <= LADDER; k++) {
+        var off = k === 0 ? 0 : d0 * Math.pow(span / d0, k / LADDER);
+        var pp = sample(edgeT + dirn * off);
+        if (pp) out.push(pp);
+      }
+      return out;
+    };
+
+    var polys = [], cur = null;
+    for (var s = 0; s < ts.length; s++) {
+      var P = ps[s];
+      if (P) {
+        if (!cur) {
+          // entering the domain: carve the incoming tail from the boundary
+          // (the ladder already ends at this sample, so don't re-add it)
+          if (s > 0) {
+            cur = ladder(boundary(ts[s], ts[s - 1]), ts[s]);
+            snapEdge(cur, true);
+          }
+          if (!cur || !cur.length) cur = [P];
+        } else {
+          cur.push(P);
+        }
+      } else if (cur) {
+        // leaving the domain: carve the outgoing tail, then close the branch
+        // (its far end re-hits the last good sample, already in cur — drop it)
+        var down = ladder(boundary(ts[s - 1], ts[s]), ts[s - 1]);
+        down.reverse();
+        cur = cur.concat(down.length ? down.slice(1) : down);
+        snapEdge(cur, false);
+        if (cur.length > 1) polys.push(cur);
+        cur = null;
+      }
+    }
+    if (cur && cur.length > 1) polys.push(cur);
+    return polys;
+  };
+
   /* flat stroked line in the plane {axes[axIdx]=c0}: a thin unlit ribbon */
   G.flatRibbon = function (polylines, axIdx, c0, win, style) {
     // width relative to the VISIBLE vertical range: constant on-screen stroke
@@ -868,7 +943,7 @@
     polylines.forEach(function (poly) {
       var n = poly.length;
       if (n < 2) return;
-      var closed = n > 3 && Math.hypot(
+      var closed = !poly.open && n > 3 && Math.hypot(
         poly[0][ia] - poly[n - 1][ia], poly[0][ib] - poly[n - 1][ib]) < win.diag * 0.01;
       if (closed) { poly = poly.slice(0, n - 1); n = poly.length; }
       var base = positions.length / 3;
@@ -1032,15 +1107,4 @@
     return group;
   };
 
-  G.region = function (F, win, style, res) {
-    // clip to window: G = max(F, plane distances) → closed solid
-    var Fw = function (x, y, z) {
-      var f = F(x, y, z);
-      var w = Math.max(win.xmin - x, x - win.xmax, win.ymin - y, y - win.ymax, win.zmin - z, z - win.zmax);
-      return Math.max(f, w);
-    };
-    var geo = G.marchingTetra(Fw, win, res || 40, true);
-    var st = { color: style.color, opacity: Math.min(style.opacity, 0.5), mesh: false };
-    return new THREE.Mesh(geo, surfaceMaterial(st));
-  };
 })();

@@ -132,6 +132,7 @@
         }
       }
       if (moved || self._needsRender) {
+        self.sortTransparent();
         self.renderer.render(self.scene, self.mode2d ? self.camera2d : self.camera);
         self._needsRender = false;
       }
@@ -142,6 +143,44 @@
 
   P.Viewport.prototype = {
     requestRender: function () { this._needsRender = true; },
+
+    /* Depth-sort every translucent plot mesh far-to-near each rendered frame:
+     * surface pairs (geometry.js surfacePair — back pass always right before
+     * its front pass) and single translucent meshes (tubes, points, ribbons,
+     * 2D fills) share one ordering. three.js's own transparent sort is
+     * useless here because all plot objects sit at the origin. Depth is the
+     * camera-space view axis, which is also correct for the 2D ortho camera
+     * (plain point distance is not). */
+    sortTransparent: function () {
+      var cam = this.mode2d ? this.camera2d : this.camera;
+      cam.updateMatrixWorld();
+      // matrixWorldInverse is only refreshed inside renderer.render — invert here
+      var mi = this._sortMat || (this._sortMat = new THREE.Matrix4());
+      mi.copy(cam.matrixWorld).invert();
+      var me = mi.elements;
+      var items = [];
+      var depth = function (o) {
+        if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+        var ctr = o.geometry.boundingSphere.center;
+        // camera-space z is negative in front; more negative = farther
+        return ctr.x * me[2] + ctr.y * me[6] + ctr.z * me[10] + me[14];
+      };
+      var objs = this.objects;
+      for (var id in objs) {
+        objs[id].traverse(function (o) {
+          if (!o.isMesh || !o.material || !o.material.transparent || !o.geometry) return;
+          if (o._transRole === 0) return;                    // back pass rides with its front
+          if (o._transRole === 1) items.push({ list: o.parent._transPair, d: depth(o) });
+          else items.push({ list: [o], d: depth(o) });
+        });
+      }
+      if (!items.length) return;
+      items.sort(function (a, b) { return a.d - b.d; }); // farthest (most negative) first
+      var order = 10;
+      for (var i = 0; i < items.length; i++) {
+        for (var m = 0; m < items[i].list.length; m++) items[i].list[m].renderOrder = order++;
+      }
+    },
 
     setMode2d: function (on) {
       this.mode2d = on;
@@ -157,9 +196,15 @@
     // the ortho frustum IS the window: world units map 1:1 onto the screen
     update2dCamera: function () {
       var w = this.win, c = this.camera2d;
-      c.left = w.xmin; c.right = w.xmax; c.top = w.ymax; c.bottom = w.ymin;
-      c.position.set((w.xmin + w.xmax) / 2, (w.ymin + w.ymax) / 2, 100);
-      c.lookAt((w.xmin + w.xmax) / 2, (w.ymin + w.ymax) / 2, 0);
+      var cx = (w.xmin + w.xmax) / 2, cy = (w.ymin + w.ymax) / 2;
+      // Frustum is symmetric about the camera position (the window center);
+      // the camera then sits at that center. Using absolute bounds here AND a
+      // centered position would offset the view twice — fine at the origin,
+      // but shifts everything once the window is panned off-centre.
+      var hx = (w.xmax - w.xmin) / 2, hy = (w.ymax - w.ymin) / 2;
+      c.left = -hx; c.right = hx; c.top = hy; c.bottom = -hy;
+      c.position.set(cx, cy, 100);
+      c.lookAt(cx, cy, 0);
       c.updateProjectionMatrix();
       this._needsRender = true;
     },

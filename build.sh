@@ -25,7 +25,7 @@ EOF
 EOF
   cat src/body.html
   for f in deps/jquery.min.js deps/mathquill.min.js deps/three.min.js deps/OrbitControls.js \
-           src/parser.js src/compile.js src/classify.js src/geometry.js src/scene.js src/ui.js src/main.js; do
+           src/parser.js src/compile.js src/classify.js src/mesher.js src/geometry.js src/scene.js src/ui.js src/main.js; do
     echo "<script>"
     cat "$f"
     echo "</script>"

@@ -42,11 +42,51 @@
 
   function diff(a, b) { return { t: 'bin', op: '-', a: a, b: b }; }
 
+  // an inequality "a op b" as a constraint that holds where the returned
+  // expression is ≤ 0 (regions live in F ≤ 0 form, like classifyInequality)
+  function ineqF(a, b, op) {
+    if (containsTuple(a) || containsTuple(b)) throw new Error('points cannot appear in a bound');
+    return (op === '<' || op === '<=') ? diff(a, b) : diff(b, a);
+  }
+  // a bound statement (a single inequality, or a chained one like a < x < b)
+  // → the list of constraint expressions it imposes. Shared by chained-
+  // inequality rows and the region object's bound fields.
+  P.regionConstraints = function (stmt) {
+    if (stmt.kind === 'chain') {
+      var cs = [];
+      for (var i = 0; i < stmt.ops.length; i++) {
+        if (stmt.ops[i] === '=') throw new Error('use < or > in a bound, not =');
+        cs.push(ineqF(stmt.terms[i], stmt.terms[i + 1], stmt.ops[i]));
+      }
+      return cs;
+    }
+    if (stmt.kind === 'rel' && stmt.op !== '=') return [ineqF(stmt.lhs, stmt.rhs, stmt.op)];
+    throw new Error('each bound must be an inequality, e.g. -2 < x < 2');
+  };
+  // combine constraints into one field F where F ≤ 0 ⇔ all constraints hold
+  P.regionF = function (nodes) {
+    return nodes.length === 1 ? nodes[0] : { t: 'call', name: 'max', args: nodes };
+  };
+
   P.classify = function (stmt, env) {
     if (stmt.kind === 'empty') return { type: 'empty' };
     if (stmt.kind === 'intersection') return { type: 'intersect' };
+    if (stmt.kind === 'region') return { type: 'region3' };
 
     if (stmt.kind === 'expr') return classifyExpr(stmt.expr, env);
+
+    // chained inequality (3 < x < 5, or x² < z < 4) → a solid region
+    if (stmt.kind === 'chain') {
+      var cs;
+      try { cs = P.regionConstraints(stmt); } catch (e) { return errorSpec(e.message); }
+      var Fchain = P.regionF(cs);
+      var chFree = P.freeVars(Fchain, env, new Set());
+      if (!subset(chFree, ['x', 'y', 'z', 'r', 'theta', 'rho', 'phi'])) return unknownVarsSpec(chFree);
+      // parts drive per-constraint normals (crisp creases); strict controls
+      // the dashed boundary in the 2D fill
+      return { type: 'region', F: Fchain, parts: cs,
+               strict: stmt.ops.every(function (o) { return o === '<' || o === '>'; }) };
+    }
 
     // relations
     var lhs = stmt.lhs, rhs = stmt.rhs, op = stmt.op;
@@ -169,7 +209,7 @@
     var F = (op === '<' || op === '<=') ? diff(lhs, rhs) : diff(rhs, lhs); // region is F ≤ 0
     var free = P.freeVars(F, env, new Set());
     if (!subset(free, ['x', 'y', 'z', 'r', 'theta', 'rho', 'phi'])) return unknownVarsSpec(free);
-    return { type: 'region', F: F };
+    return { type: 'region', F: F, strict: op === '<' || op === '>' };
   }
 
   function classifyExpr(expr, env) {

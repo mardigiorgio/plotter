@@ -47,7 +47,8 @@
     this.env = { constVals: {}, funcs: {}, funcJS: {} };
     this.envErrors = {};   // rowId → message
     this.constOrder = [];  // [{name, rhs, isTuple, row}]
-    this._buildKeys = {};  // rowId → key
+    this._buildKeys = {};    // rowId → key
+    this._contentKeys = {};  // rowId → window-independent key (gesture reuse)
     this._recomputeTimer = null;
     this._playing = new Set();
 
@@ -234,14 +235,15 @@
       }, 260);
     },
 
-    /* live opacity: mutate materials, no re-tessellation */
+    /* live opacity: mutate materials, no re-tessellation. _opacityMul lets a
+     * material keep a fixed ratio to the row opacity (2D region fills). */
     applyOpacityLive: function (row, v) {
       row.state.opacity = v;
-      var vv = row.spec && row.spec.type === 'region' ? Math.min(v, 0.5) : v;
       var obj = this.viewport.objects[row.id];
       if (!obj) return;
       obj.traverse(function (o) {
         if (!o.material || !o.material._styleOpacity) return;
+        var vv = v * (o.material._opacityMul || 1);
         o.material.opacity = vv;
         o.material.transparent = vv < 1;
         o.material.depthWrite = vv >= 0.99;
@@ -512,11 +514,11 @@
       return null;
     },
 
-    // Sample a solved xy-plane form as polylines, once per screen column across
-    // the VISIBLE window (Desmos-style): the sample count is bounded by screen
-    // resolution, not the zoom level, so this stays fast at any zoom and the
-    // curve is pinned exactly to the grid. Runs of samples break at undefined
-    // points and at asymptote-sized jumps.
+    // Solve an xy-plane form into a map t↦[x,y,0], then hand it to
+    // G.planarSample, which samples once per screen column across the VISIBLE
+    // window (Desmos-style): bounded by screen resolution, not zoom level, so
+    // it stays fast at any zoom and pins the curve exactly to the grid, while
+    // carrying vertical-asymptote tails out to the edge and splitting poles.
     planarPolylines: function (spec, env, pw) {
       var map = null, a = 0, b = 1, param = false;
       try {
@@ -531,7 +533,12 @@
         } else if (spec.type === 'cyl') {
           var fr = P.makeFn(spec.expr, ['theta', 'z'], env);
           a = 0; b = 2 * Math.PI; param = true;
-          map = function (t) { var r = fr(t, 0); return [r * Math.cos(t), r * Math.sin(t), 0]; };
+          map = function (t) {
+            var r = fr(t, 0);
+            // r >= 0 by definition; negative r would reflect across the origin
+            if (!(r >= 0)) return null;
+            return [r * Math.cos(t), r * Math.sin(t), 0];
+          };
         } else if (spec.type === 'thetaSurf' && spec.isConst) {
           var tc = P.evalConst(spec.expr, env);
           var R = Math.hypot(Math.max(Math.abs(pw.xmin), pw.xmax), Math.max(Math.abs(pw.ymin), pw.ymax));
@@ -540,45 +547,16 @@
       } catch (e) { return null; }
       if (!map) return null;
 
-      var xr = pw.xmax - pw.xmin, yr = pw.ymax - pw.ymin;
-      // keep a window of margin so near-vertical parts run off-screen cleanly
-      var xlo = pw.xmin - xr, xhi = pw.xmax + xr;
-      var ylo = pw.ymin - yr, yhi = pw.ymax + yr;
-      var inView = function (p) {
-        return p[0] >= xlo && p[0] <= xhi && p[1] >= ylo && p[1] <= yhi;
-      };
       var W = 1200;
       try { W = this.viewport.renderer.domElement.clientWidth || 1200; } catch (e) { }
       // one sample per (fraction of a) screen pixel; closed polar curves get a
-      // fixed high count since they don't scan the x-axis
+      // fixed high count since they don't scan the x-axis. During a gesture,
+      // sample coarser so the rebuild stays live.
       var N = param ? 720 : Math.max(400, Math.min(4000, Math.round(W * 1.5)));
-      var jump = param ? Infinity : Math.max(xr, yr) * 2; // asymptote-sized break
-      var polys = [], cur = null, prev = null;
-      for (var i = 0; i <= N; i++) {
-        var t = a + (b - a) * i / N;
-        var p;
-        try { p = map(t); } catch (e2) { p = null; }
-        var ok = p && isFinite(p[0]) && isFinite(p[1]);
-        if (ok && cur && prev &&
-            (Math.abs(p[0] - prev[0]) > jump || Math.abs(p[1] - prev[1]) > jump)) {
-          if (cur.length > 1) polys.push(cur);
-          cur = null; // discontinuity (asymptote): don't bridge it
-        }
-        if (ok && inView(p)) {
-          if (!cur) cur = [];
-          cur.push(p);
-          prev = p;
-        } else if (ok) {
-          // just outside: include one point so the line reaches the edge, then end
-          if (cur) { cur.push(p); if (cur.length > 1) polys.push(cur); cur = null; }
-          prev = p;
-        } else {
-          if (cur && cur.length > 1) polys.push(cur);
-          cur = null; prev = null;
-        }
-      }
-      if (cur && cur.length > 1) polys.push(cur);
-      return polys;
+      if (this._fastMode) N = Math.max(300, Math.round(N * 0.5));
+      // asymptote tails (ln, 1/x, tan) are carried to the screen edge and poles
+      // split the curve instead of being bridged — see G.planarSample
+      return P.geom.planarSample(map, a, b, pw, { N: N, param: param });
     },
 
     meshGeometryFor: function (row) {
@@ -651,12 +629,22 @@
       }
       row.spec = spec;
 
+      // solids default translucent: a FRESH row (no saved opacity, untouched
+      // at 1) that classifies as a region drops to 0.45 once; explicit user
+      // choices — including saved full opacity — always stick
+      if ((spec.type === 'region' || spec.type === 'region3') &&
+          !row._opacityExplicit && row.state.opacity === 1 && !row._regionOpacityDefaulted) {
+        row._regionOpacityDefaulted = true;
+        row.state.opacity = 0.45;
+      }
+
       // rows with nothing to render drop their geometry
       var renderless = ['empty', 'error', 'slider', 'constdef', 'constExpr'].indexOf(spec.type) !== -1 ||
         (spec.type === 'definition' && !spec.render);
       if (renderless) {
         this.viewport.removeObject(row.id);
         delete this._buildKeys[row.id];
+        delete this._contentKeys[row.id];
       }
 
       // substrip: rebuild only when its KIND changes, so recomputes triggered by
@@ -681,6 +669,9 @@
             '|' + (row._isectA ? row._isectA.id : '') + ',' + (row._isectB ? row._isectB.id : '');
           break;
         }
+        // stable kind: the fields persist across recomputes; bound edits rebuild
+        // the geometry (buildKey), not the substrip, so typing keeps focus
+        case 'region3': kind = 'region3'; break;
       }
 
       if (errMsg) {
@@ -721,6 +712,12 @@
               self.saveSoon();
             });
             break;
+          case 'region3':
+            row.showRegionBounds(row.state.regionBounds, function () {
+              self.recompute();
+              self.saveSoon();
+            });
+            break;
         }
       } else {
         // same kind — refresh values in place
@@ -753,8 +750,11 @@
       });
     },
 
-    buildKey: function (row) {
-      var spec = row.spec, s = row.state, w = this.plotWin();
+    // contentOnly blanks the window and fast-mode slots: comparing content
+    // keys detects gesture rebuilds where ONLY the window moved, so the
+    // existing full-quality mesh can be kept until settle.
+    buildKey: function (row, contentOnly) {
+      var spec = row.spec, s = row.state, w = contentOnly ? null : this.plotWin();
       if (spec.type === 'intersect') {
         var pair = this.resolveIsect(row) || [];
         var extras = pair.map(function (r2) {
@@ -772,6 +772,22 @@
       if (spec.body) nodes.push(spec.body);
       if (spec.args) nodes = nodes.concat(spec.args);
       if (spec.render && spec.render.expr) nodes.push(spec.render.expr);
+      // region3 geometry comes from the bound fields — their slider/const
+      // deps must dirty the key too (parsed nodes cached per bounds text)
+      if (spec.type === 'region3' && s.regionBounds) {
+        var bKey = s.regionBounds.join('|');
+        if (row._boundsKey !== bKey) {
+          row._boundsKey = bKey;
+          row._boundNodes = [];
+          s.regionBounds.forEach(function (str) {
+            str = (str || '').trim();
+            if (!str) return;
+            try { row._boundNodes = row._boundNodes.concat(P.regionConstraints(P.parse(str))); }
+            catch (e) { /* invalid bound: buildObject reports it */ }
+          });
+        }
+        nodes = nodes.concat(row._boundNodes || []);
+      }
       var deps = this.depValues(nodes);
       // evaluated domain bounds may reference sliders — key on the values, not the strings
       var domVals = {};
@@ -783,18 +799,25 @@
       // note: opacity is intentionally NOT in the key — it is applied live to materials
       return JSON.stringify([s.latex, spec.type, w, s.color, s.mesh, s.res, s.density, s.label,
         s.domains, domVals, deps, this.viewport.showBox, (s.flat2d || this.mode2d) ? '2d' : '3d',
-        this._fastMode ? 'fast' : 'full']);
+        contentOnly ? '' : (this._fastMode ? 'fast' : 'full'), s.regionBounds]);
     },
 
     buildGeomIfDirty: function (row) {
       var spec = row.spec;
-      var renderable = ['graph', 'cyl', 'thetaSurf', 'sph', 'phiSurf', 'implicit', 'region',
+      var renderable = ['graph', 'cyl', 'thetaSurf', 'sph', 'phiSurf', 'implicit', 'region', 'region3',
         'curve', 'psurf', 'point', 'namedPoint', 'vector', 'vfield', 'intersect'].indexOf(spec.type) !== -1 ||
         (spec.type === 'definition' && spec.render);
       if (!renderable) return;
-      // intersection curves and 2D traces do not move when only the window
-      // changes; keep them as-is during zoom gestures, rebuild at settle
-      if (this._fastMode && (spec.type === 'intersect' || row.state.flat2d)) return;
+      // Gestures move only the window/camera: a row whose CONTENT is
+      // unchanged keeps its full-quality mesh (the settle pass re-fits it to
+      // the new window ~200ms later). Rebuilding coarse per wheel frame made
+      // every surface visibly chunky mid-zoom. Slider-driven changes still
+      // rebuild here because the field itself is morphing.
+      if (this._fastMode) {
+        if (spec.type === 'intersect' || row.state.flat2d) return;
+        if (this._contentKeys[row.id] === this.buildKey(row, true) &&
+            this.viewport.objects[row.id]) return;
+      }
       // the 2D view only draws objects that live in the xy-plane
       if (this.mode2d) {
         var eff = spec.type === 'definition' ? spec.render : spec;
@@ -807,6 +830,7 @@
         if (!ok2d) {
           this.viewport.removeObject(row.id);
           delete this._buildKeys[row.id];
+        delete this._contentKeys[row.id];
           row.setError('3D object. Press the 3D button to see it');
           return;
         }
@@ -814,6 +838,7 @@
       var key = this.buildKey(row);
       if (this._buildKeys[row.id] === key && this.viewport.objects[row.id]) return;
       this._buildKeys[row.id] = key;
+      this._contentKeys[row.id] = this.buildKey(row, true);
       try {
         var obj = this.buildObject(row, spec.type === 'definition' ? spec.render : spec);
         this.viewport.setObject(row.id, obj);
@@ -853,15 +878,19 @@
           // F is z-independent here (fv === 'z'), so evaluate on the same
           // z-clamped plane the old sliced-mesh path drew the trace on.
           if (spec.type === 'implicit' || spec.type === 'region') {
-            // adaptive contour: refines only along the curve, so it stays smooth
-            // however small the feature is on screen (see G.marchingSquaresAdaptive)
+            // adaptive sampling: refines only along the boundary, so it stays
+            // smooth however small the feature is on screen
             var baseRes = s.res ? Math.max(64, Math.min(256, s.res * 2)) : 128;
             var refine = 3;
             if (this._fastMode) { baseRes = Math.min(baseRes, 80); refine = 2; }
             var c0 = Math.max(win.zmin, Math.min(win.zmax, 0));
             var Fxy = P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST });
-            var msPolys = G.marchingSquaresAdaptive(
-              function (x, y) { return Fxy(x, y, c0); }, win, baseRes, refine);
+            var fxy = function (x, y) { return Fxy(x, y, c0); };
+            if (spec.type === 'region') {
+              // Desmos-style translucent fill + stroke (dashed when strict)
+              return G.regionFill2D(fxy, win, style, baseRes, refine, spec.strict, c0);
+            }
+            var msPolys = G.marchingSquaresAdaptive(fxy, win, baseRes, refine);
             return G.flatRibbon(msPolys, 2, c0, win, style);
           }
         }
@@ -912,14 +941,49 @@
         case 'sph': return G.sph(P.makeFn(spec.expr, ['phi', 'theta'], env), win, style, res);
         case 'phiSurf': return G.phiSurf(P.makeFn(spec.expr, ['rho', 'theta'], env), win, style, res);
         case 'implicit': {
-          var iRes = s.res ? Math.max(20, Math.min(96, Math.round(s.res * 0.75))) : 44;
+          var iRes = s.res ? Math.max(20, Math.min(96, Math.round(s.res * 0.75))) : 48;
           if (this._fastMode) iRes = (this._lastFastMs || 0) > 9 ? 12 : 16;
-          return G.implicit(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, iRes);
+          return G.implicit(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, iRes, this._fastMode);
         }
         case 'region': {
           var rRes = s.res ? Math.max(20, Math.min(80, Math.round(s.res * 0.6))) : 44;
           if (this._fastMode) rRes = (this._lastFastMs || 0) > 9 ? 12 : 16;
-          return G.region(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, rRes);
+          var rParts = null;
+          if (spec.parts && spec.parts.length > 1 && !this._fastMode) {
+            rParts = spec.parts.map(function (nd) {
+              return P.makeFn(nd, ['x', 'y', 'z'], env, { subst: P.CART_SUBST });
+            });
+          }
+          return G.region(P.makeFn(spec.F, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, rRes, rParts, this._fastMode);
+        }
+        case 'region3': {
+          // one solid from up to three inequality fields (each may be chained,
+          // e.g. x²+y² < z < 4). All constraints intersect: F = max(gᵢ) ≤ 0.
+          var nodes = [];
+          (s.regionBounds || []).forEach(function (str, bi) {
+            str = (str || '').trim();
+            if (!str) return;
+            var bst, bc;
+            try { bst = P.parse(str); } catch (e) { throw new Error('bound ' + (bi + 1) + ': ' + e.message); }
+            try { bc = P.regionConstraints(bst); } catch (e2) { throw new Error('bound ' + (bi + 1) + ': ' + e2.message); }
+            nodes = nodes.concat(bc);
+          });
+          if (!nodes.length) throw new Error('define at least one bound, e.g. -2 < x < 2');
+          var RF = P.regionF(nodes);
+          var bad = [];
+          P.freeVars(RF, env, new Set()).forEach(function (n) {
+            if (['x', 'y', 'z', 'r', 'theta', 'rho', 'phi'].indexOf(n) === -1) bad.push(n);
+          });
+          if (bad.length) throw new Error('unknown ' + (bad.length > 1 ? 'variables' : 'variable') + ': ' + bad.join(', '));
+          var r3Res = s.res ? Math.max(20, Math.min(80, Math.round(s.res * 0.6))) : 44;
+          if (this._fastMode) r3Res = (this._lastFastMs || 0) > 9 ? 12 : 16;
+          var r3Parts = null;
+          if (nodes.length > 1 && !this._fastMode) {
+            r3Parts = nodes.map(function (nd) {
+              return P.makeFn(nd, ['x', 'y', 'z'], env, { subst: P.CART_SUBST });
+            });
+          }
+          return G.region(P.makeFn(RF, ['x', 'y', 'z'], env, { subst: P.CART_SUBST }), win, style, r3Res, r3Parts, this._fastMode);
         }
         case 'curve': {
           var td = row.getDomain('t', 0, 2 * Math.PI);

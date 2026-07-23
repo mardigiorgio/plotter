@@ -302,6 +302,330 @@
     ok(G2.overscanNeed(zin16, ov, true), 'settle after 1.6x zoom-in resamples');
   } catch (e) { ok(false, 'overscan suite threw', e.message); }
 
+  /* ---------- planarSample: asymptote tails reach the edge, poles split ---------- */
+  try {
+    var G3 = P.geom;
+    var flat = function (polys) { return polys.reduce(function (s, p) { return s.concat(p); }, []); };
+    var W3 = { xmin: -8, xmax: 8, ymin: -6, ymax: 6 };
+
+    // ln(x): defined only for x>0; the vertical tail must dive to the bottom edge
+    var lnP = G3.planarSample(function (t) { return [t, Math.log(t), 0]; }, W3.xmin, W3.xmax, W3, { N: 400 });
+    var lnPts = flat(lnP);
+    ok(lnP.length >= 1, 'ln: produces a curve');
+    ok(lnPts.every(function (q) { return q[0] > -1e-6; }), 'ln: no points at x<=0');
+    var lnMinY = Math.min.apply(null, lnPts.map(function (q) { return q[1]; }));
+    ok(lnMinY <= W3.ymin, 'ln: asymptote tail reaches the bottom edge (minY=' + lnMinY.toFixed(2) + ')');
+
+    // ln(x) zoomed way out: the tail must STILL reach the bottom edge (the old
+    // absolute snapEdge threshold made this fail once the window grew large)
+    [ {ymin:-60,ymax:60}, {ymin:-600,ymax:600}, {ymin:-60000,ymax:60000} ].forEach(function (yw) {
+      var WZ = { xmin: -yw.ymax * 1.6, xmax: yw.ymax * 1.6, ymin: yw.ymin, ymax: yw.ymax };
+      var p = G3.planarSample(function (t) { return [t, Math.log(t), 0]; }, WZ.xmin, WZ.xmax, WZ, { N: 3000 });
+      var mn = Math.min.apply(null, flat(p).map(function (q) { return q[1]; }));
+      ok(mn <= WZ.ymin, 'ln zoomed to y=' + yw.ymax + ': tail reaches bottom (minY=' + mn.toFixed(1) + ')');
+    });
+
+    // sqrt(x): finite at its domain edge → must NOT sprout a fake vertical tail
+    var sqP = G3.planarSample(function (t) { return [t, Math.sqrt(t), 0]; }, W3.xmin, W3.xmax, W3, { N: 400 });
+    var sqPts = flat(sqP);
+    ok(sqPts.every(function (q) { return q[0] > -1e-6; }), 'sqrt: no points at x<0');
+    var sqMinY = Math.min.apply(null, sqPts.map(function (q) { return q[1]; }));
+    ok(sqMinY > -0.5, 'sqrt: no fake asymptote tail (minY=' + sqMinY.toFixed(3) + ')');
+
+    // 1/x with samples that exceed the box near the pole (box-exit path)
+    var invP = G3.planarSample(function (t) { return [t, 1 / t, 0]; }, W3.xmin, W3.xmax, W3, { N: 400 });
+    ok(invP.length === 2, '1/x: split into two branches (got ' + invP.length + ')');
+    var noBridge = function (polys, win) {
+      var yr = win.ymax - win.ymin;
+      return polys.every(function (p) {
+        for (var i = 1; i < p.length; i++) {
+          if ((p[i - 1][0] < 0) !== (p[i][0] < 0) && Math.abs(p[i][1] - p[i - 1][1]) > yr) return false;
+        }
+        return true;
+      });
+    };
+    ok(noBridge(invP, W3), '1/x: no spurious vertical bridge across x=0');
+    var invPts = flat(invP);
+    ok(Math.max.apply(null, invPts.map(function (q) { return q[1]; })) >= W3.ymax &&
+       Math.min.apply(null, invPts.map(function (q) { return q[1]; })) <= W3.ymin,
+      '1/x: both tails reach the top and bottom edges');
+
+    // 1/(x-0.3), wide y-window: neighbours straddle the pole while staying
+    // in-box, so only pole detection (not box-exit) can split it
+    var WY = { xmin: -8, xmax: 8, ymin: -100, ymax: 100 };
+    var invW = G3.planarSample(function (t) { return [t, 1 / (t - 0.3), 0]; }, WY.xmin, WY.xmax, WY, { N: 400 });
+    ok(invW.length === 2, '1/(x-0.3) wide-y: pole split when neighbours stay in-box (got ' + invW.length + ')');
+    ok(invW.every(function (p) {
+      for (var i = 1; i < p.length; i++) {
+        if ((p[i - 1][0] < 0.3) !== (p[i][0] < 0.3) && Math.abs(p[i][1] - p[i - 1][1]) > 200) return false;
+      }
+      return true;
+    }), '1/(x-0.3) wide-y: no bridge through the pole');
+
+    // tan(x): several poles → several branches, none bridged
+    var tanP = G3.planarSample(function (t) { return [t, Math.tan(t), 0]; }, -4, 4, W3, { N: 600 });
+    ok(tanP.length >= 3, 'tan: multiple branches across poles (got ' + tanP.length + ')');
+    ok(tanP.every(function (p) {
+      for (var i = 1; i < p.length; i++) {
+        if (Math.abs(p[i][0] - p[i - 1][0]) < 0.2 && Math.abs(p[i][1] - p[i - 1][1]) > (W3.ymax - W3.ymin)) return false;
+      }
+      return true;
+    }), 'tan: no spurious vertical bridge through a pole');
+
+    // plain line y=x fully inside the box: one clean run, no artifacts
+    ok(G3.planarSample(function (t) { return [t, t, 0]; }, W3.xmin, W3.xmax, W3, { N: 200 }).length === 1,
+      'line y=x: single run');
+
+    // bounded oscillation must not explode the sampler nor split spuriously
+    var oscP = G3.planarSample(function (t) { return [t, Math.sin(t * 20), 0]; }, W3.xmin, W3.xmax, W3, { N: 300 });
+    var oscPts = flat(oscP);
+    ok(oscPts.length < 20000, 'oscillation: sampler stays bounded (' + oscPts.length + ' pts)');
+    ok(oscPts.every(function (q) { return Math.abs(q[1]) <= 1.0001; }), 'oscillation: values stay on the curve');
+  } catch (e) { ok(false, 'planarSample suite threw', e.message + ' | ' + (e.stack || '')); }
+
+  /* ---------- 3D box clipping: clean asymptote edges, no pole bridging ---------- */
+  try {
+    var G4 = P.geom;
+    var box = { xmin: -4, xmax: 4, ymin: -4, ymax: 4, zmin: -4, zmax: 4 };
+    ok(G4.clampState([0, 0, 0], box) === 0, 'clampState: origin is strictly inside');
+    ok(G4.clampState([0, 0, 5], box) === 1, 'clampState: just past a wall is clamped');
+    ok(G4.clampState([0, 0, 20], box) === 2, 'clampState: far beyond is outside');
+
+    var tri = function (a, b, c) {
+      return [a, b, c].map(function (p) { return { p: p, n: [0, 0, 1] }; });
+    };
+    // fully inside → unchanged 3-gon
+    var inRing = G4.clipToBox(tri([0, 0, 0], [1, 0, 0], [0, 1, 0]), box);
+    ok(inRing.length === 3, 'clipToBox: interior triangle passes through');
+    // fully outside → empty
+    ok(G4.clipToBox(tri([10, 10, 10], [11, 10, 10], [10, 11, 10]), box).length === 0,
+      'clipToBox: fully-outside triangle is removed');
+    // one vertex above z=4 (a 1/x-style wall reaching the top): clipped ON z=4
+    var cut = G4.clipToBox(tri([0, 0, 0], [1, 0, 8], [0, 1, 0]), box);
+    ok(cut.length >= 3, 'clipToBox: partly-above triangle keeps a face');
+    ok(cut.every(function (v) { return v.p[2] <= box.zmax + 1e-9; }), 'clipToBox: nothing survives above z=zmax');
+    ok(cut.some(function (v) { return Math.abs(v.p[2] - box.zmax) < 1e-9; }), 'clipToBox: a crisp edge lands exactly on z=zmax');
+  } catch (e) { ok(false, 'clip suite threw', e.message + ' | ' + (e.stack || '')); }
+
+  /* ---------- chained inequalities & the region object ---------- */
+  try {
+    var rsubst = { subst: P.CART_SUBST };
+    // chained inequality → a solid region, F ≤ 0 exactly where all parts hold
+    var chSpec = classifyLatex('3<x<5');
+    ok(chSpec.type === 'region', 'chain 3<x<5 → region');
+    var chF = P.makeFn(chSpec.F, ['x', 'y', 'z'], emptyEnv(), rsubst);
+    ok(chF(4, 0, 0) <= 0, 'chain: x=4 inside 3<x<5');
+    ok(chF(2, 0, 0) > 0 && chF(6, 0, 0) > 0, 'chain: x=2 and x=6 outside 3<x<5');
+
+    // curved bounds: x² + y² < z < 4
+    var cvSpec = classifyLatex('x^{2}+y^{2}<z<4');
+    ok(cvSpec.type === 'region', 'curved bound → region');
+    var cvF = P.makeFn(cvSpec.F, ['x', 'y', 'z'], emptyEnv(), rsubst);
+    ok(cvF(0, 0, 2) <= 0, 'curved: (0,0,2) inside (x²+y² < z < 4)');
+    ok(cvF(0, 0, 5) > 0, 'curved: (0,0,5) outside (z > 4)');
+    ok(cvF(1.9, 0, 1) > 0, 'curved: (1.9,0,1) outside (z < x²+y²)');
+
+    // bare "region" keyword → region3 object
+    ok(P.parse('\\operatorname{region}').kind === 'region', 'region keyword parses');
+    ok(P.classify(P.parse('\\operatorname{region}'), emptyEnv()).type === 'region3', 'region → region3 spec');
+
+    // three bound fields intersect into one solid
+    var parts = P.regionConstraints(P.parse('-2<x<2'))
+      .concat(P.regionConstraints(P.parse('y<1')))
+      .concat(P.regionConstraints(P.parse('z>0')));
+    var rF = P.makeFn(P.regionF(parts), ['x', 'y', 'z'], emptyEnv(), rsubst);
+    ok(rF(0, 0, 1) <= 0, 'region: (0,0,1) satisfies all three bounds');
+    ok(rF(0, 3, 1) > 0, 'region: y=3 violates y<1');
+    ok(rF(5, 0, 1) > 0, 'region: x=5 violates -2<x<2');
+    ok(rF(0, 0, -1) > 0, 'region: z=-1 violates z>0');
+
+    // equality is not a valid bound
+    var threwEq = false;
+    try { P.regionConstraints(P.parse('x=2')); } catch (e2) { threwEq = true; }
+    ok(threwEq, 'region: equality bound rejected');
+  } catch (e) { ok(false, 'region suite threw', e.message + ' | ' + (e.stack || '')); }
+
+  /* ---------- mesher: polygonizer, caps, 2D fill ---------- */
+  try {
+    var MM = P.mesher;
+    var win8 = { xmin: -4, xmax: 4, ymin: -4, ymax: 4, zmin: -4, zmax: 4 };
+    var vkey = function (pos, vi) {
+      return pos[vi * 3].toFixed(7) + ',' + pos[vi * 3 + 1].toFixed(7) + ',' + pos[vi * 3 + 2].toFixed(7);
+    };
+    // undirected edge → triangle count over one or more meshes
+    var edgeCounts = function (meshes) {
+      var counts = new Map();
+      meshes.forEach(function (m) {
+        for (var t = 0; t < m.idx.length; t += 3) {
+          for (var e = 0; e < 3; e++) {
+            var a = vkey(m.pos, m.idx[t + e]), b = vkey(m.pos, m.idx[t + (e + 1) % 3]);
+            if (a === b) continue; // degenerate (coincident refined crossings)
+            var kk = a < b ? a + '|' + b : b + '|' + a;
+            counts.set(kk, (counts.get(kk) || 0) + 1);
+          }
+        }
+      });
+      return counts;
+    };
+
+    // 1. sphere: closed manifold, refined vertices on the surface, sane normals
+    var sphF = function (x, y, z) { return x * x + y * y + z * z - 9; };
+    var sph = MM.polygonize(sphF, win8, 20, { refine: true, gradF: true });
+    ok(sph.idx.length / 3 > 300, 'mesher: sphere has a real triangle count', String(sph.idx.length / 3));
+    var badEdge = 0;
+    edgeCounts([sph]).forEach(function (nTri) { if (nTri !== 2) badEdge++; });
+    ok(badEdge === 0, 'mesher: sphere mesh is a closed manifold', badEdge + ' bad edges');
+    var worstF = 0, worstN = 1, badWind = 0;
+    for (var sv = 0; sv < sph.pos.length; sv += 3) {
+      worstF = Math.max(worstF, Math.abs(sphF(sph.pos[sv], sph.pos[sv + 1], sph.pos[sv + 2])));
+      var rl = Math.hypot(sph.pos[sv], sph.pos[sv + 1], sph.pos[sv + 2]);
+      worstN = Math.min(worstN,
+        (sph.nrm[sv] * sph.pos[sv] + sph.nrm[sv + 1] * sph.pos[sv + 1] + sph.nrm[sv + 2] * sph.pos[sv + 2]) / rl);
+    }
+    ok(worstF < 1e-4, 'mesher: refined vertices sit on the sphere', 'max |F| = ' + worstF);
+    ok(worstN > 0.99, 'mesher: sphere normals are radial', 'min dot = ' + worstN);
+    for (var st = 0; st < sph.idx.length; st += 3) {
+      var A3 = sph.idx[st] * 3, B3 = sph.idx[st + 1] * 3, C3 = sph.idx[st + 2] * 3;
+      var ux = sph.pos[B3] - sph.pos[A3], uy = sph.pos[B3 + 1] - sph.pos[A3 + 1], uz = sph.pos[B3 + 2] - sph.pos[A3 + 2];
+      var wx = sph.pos[C3] - sph.pos[A3], wy = sph.pos[C3 + 1] - sph.pos[A3 + 1], wz = sph.pos[C3 + 2] - sph.pos[A3 + 2];
+      var cxv = uy * wz - uz * wy, cyv = uz * wx - ux * wz, czv = ux * wy - uy * wx;
+      if (cxv * sph.pos[A3] + cyv * sph.pos[A3 + 1] + czv * sph.pos[A3 + 2] < 0) badWind++;
+    }
+    ok(badWind === 0, 'mesher: sphere winding is outward', badWind + ' flipped');
+
+    // 2. region paraboloid + caps: the union is a closed solid, caps are planar
+    var parF = function (x, y, z) { return z - 3.7 + x * x + y * y; };
+    var par = MM.polygonize(parF, win8, 16, { refine: true, gradF: true });
+    var caps = MM.buildCaps(win8, 16, par.cache);
+    ok(caps.idx.length > 0, 'mesher: paraboloid region grows caps');
+    var openEdges = 0;
+    edgeCounts([par, caps]).forEach(function (nTri) { if (nTri !== 2) openEdges++; });
+    ok(openEdges === 0, 'mesher: surface+caps form a closed solid (seam is exact)', openEdges + ' open/bad edges');
+    var capPlanar = true;
+    for (var cv = 0; cv < caps.pos.length; cv += 3) {
+      var onFace = Math.abs(caps.pos[cv]) === 4 || Math.abs(caps.pos[cv + 1]) === 4 || Math.abs(caps.pos[cv + 2]) === 4;
+      if (!onFace) capPlanar = false;
+    }
+    ok(capPlanar, 'mesher: every cap vertex lies exactly on a box face');
+
+    // 3. region3 crease: max(x-1, z) with parts → normals are pure ±ex / ±ez
+    var g1 = function (x, y, z) { return x - 1; };
+    var g2 = function (x, y, z) { return z; };
+    var mxF = function (x, y, z) { return Math.max(g1(x, y, z), g2(x, y, z)); };
+    var mx = MM.polygonize(mxF, win8, 16, { refine: true, gradF: true, parts: [g1, g2] });
+    var blended = 0;
+    for (var mv = 0; mv < mx.nrm.length; mv += 3) {
+      var dx2 = Math.abs(mx.nrm[mv]), dz2 = Math.abs(mx.nrm[mv + 2]);
+      if (!(dx2 > 0.999 || dz2 > 0.999)) blended++;
+    }
+    ok(blended === 0, 'mesher: crease normals come from one constraint each', blended + ' blended');
+    // split vertices: some position occurs twice, once with each constraint's
+    // normal (shared loop vertices of triangles on either side of the crease)
+    var creasePos = {};
+    for (var mv2 = 0; mv2 < mx.pos.length; mv2 += 3) {
+      var pk = mx.pos[mv2].toFixed(7) + ',' + mx.pos[mv2 + 1].toFixed(7) + ',' + mx.pos[mv2 + 2].toFixed(7);
+      creasePos[pk] = (creasePos[pk] || 0) | (Math.abs(mx.nrm[mv2]) > 0.999 ? 1 : 2);
+    }
+    var split = Object.keys(creasePos).some(function (kk) { return creasePos[kk] === 3; });
+    ok(split, 'mesher: crease vertices split into per-constraint copies');
+
+    // 4. 2D fill: disc area, saddle-consistent fill, contours returned
+    var triArea = function (fill) {
+      var area = 0;
+      for (var t2 = 0; t2 < fill.idx.length; t2 += 3) {
+        var a2 = fill.idx[t2] * 3, b2 = fill.idx[t2 + 1] * 3, c2 = fill.idx[t2 + 2] * 3;
+        area += Math.abs((fill.pos[b2] - fill.pos[a2]) * (fill.pos[c2 + 1] - fill.pos[a2 + 1]) -
+                         (fill.pos[c2] - fill.pos[a2]) * (fill.pos[b2 + 1] - fill.pos[a2 + 1])) / 2;
+      }
+      return area;
+    };
+    var disc = MM.fillRegion2D(function (x, y) { return x * x + y * y - 4; }, win8, 64, 3);
+    ok(Math.abs(triArea(disc) - Math.PI * 4) < Math.PI * 4 * 0.01,
+      'mesher: disc fill area ≈ 4π', 'got ' + triArea(disc));
+    ok(disc.contours.length >= 1, 'mesher: disc fill returns stroke contours');
+    var quads = MM.fillRegion2D(function (x, y) { return x * y; }, win8, 64, 3);
+    ok(Math.abs(triArea(quads) - 32) < 32 * 0.02,
+      'mesher: xy<0 fill (saddle checkerboard) ≈ half the window', 'got ' + triArea(quads));
+
+    // 2b. cap winding: face-winding normal must agree with the stored outward
+    // normal on EVERY face — the y-faces used a left-handed axis pair once
+    var capWind = function (caps, label) {
+      var badW = 0;
+      for (var ct = 0; ct < caps.idx.length; ct += 3) {
+        var a4 = caps.idx[ct] * 3, b4 = caps.idx[ct + 1] * 3, c4 = caps.idx[ct + 2] * 3;
+        var ux2 = caps.pos[b4] - caps.pos[a4], uy2 = caps.pos[b4 + 1] - caps.pos[a4 + 1], uz2 = caps.pos[b4 + 2] - caps.pos[a4 + 2];
+        var wx2 = caps.pos[c4] - caps.pos[a4], wy2 = caps.pos[c4 + 1] - caps.pos[a4 + 1], wz2 = caps.pos[c4 + 2] - caps.pos[a4 + 2];
+        var fx2 = uy2 * wz2 - uz2 * wy2, fy2 = uz2 * wx2 - ux2 * wz2, fz2 = ux2 * wy2 - uy2 * wx2;
+        if (fx2 * caps.nrm[a4] + fy2 * caps.nrm[a4 + 1] + fz2 * caps.nrm[a4 + 2] <= 0) badW++;
+      }
+      ok(badW === 0, 'mesher: cap winding matches outward normals (' + label + ')', badW + ' flipped');
+    };
+    capWind(caps, 'paraboloid z-caps');
+    var cylY = MM.polygonize(function (x, y, z) { return x * x + z * z - 9; }, win8, 16, { refine: true, gradF: true });
+    capWind(MM.buildCaps(win8, 16, cylY.cache), 'y-axis cylinder y-caps');
+
+    // 2c. full-window region: six merged face quads, closed box, wound outward
+    var boxAll = MM.polygonize(function (x, y, z) { return z - 100; }, win8, 16, { refine: true, gradF: true });
+    var boxCaps = MM.buildCaps(win8, 16, boxAll.cache);
+    ok(boxAll.idx.length === 0, 'mesher: full-window region has no interior surface');
+    ok(boxCaps.idx.length === 36, 'mesher: full-window region caps merge to 6 quads', boxCaps.idx.length + ' indices');
+    var boxOpen = 0;
+    edgeCounts([boxCaps]).forEach(function (nTri) { if (nTri !== 2) boxOpen++; });
+    ok(boxOpen === 0, 'mesher: merged box caps close up', boxOpen + ' bad edges');
+    capWind(boxCaps, 'full box');
+
+    // 4b. domain-edge fill: y < sqrt(x) with x=0 off-lattice must fill to
+    // within a sub-cell of the domain edge (it used to skip whole base cells)
+    var winOff = { xmin: -4.03, xmax: 4.05, ymin: -4.03, ymax: 4.05, zmin: -4, zmax: 4 };
+    var sqf = MM.fillRegion2D(function (x, y) { return y - Math.sqrt(x); }, winOff, 64, 3);
+    var covered = false;
+    var px2 = 0.02, py2 = -2.5; // inside the region, just right of the domain edge
+    for (var ft = 0; ft < sqf.idx.length && !covered; ft += 3) {
+      var ax3 = sqf.pos[sqf.idx[ft] * 3], ay3 = sqf.pos[sqf.idx[ft] * 3 + 1];
+      var bx4 = sqf.pos[sqf.idx[ft + 1] * 3], by4 = sqf.pos[sqf.idx[ft + 1] * 3 + 1];
+      var cx4 = sqf.pos[sqf.idx[ft + 2] * 3], cy4 = sqf.pos[sqf.idx[ft + 2] * 3 + 1];
+      var d1 = (bx4 - ax3) * (py2 - ay3) - (by4 - ay3) * (px2 - ax3);
+      var d2 = (cx4 - bx4) * (py2 - by4) - (cy4 - by4) * (px2 - bx4);
+      var d3 = (ax3 - cx4) * (py2 - cy4) - (ay3 - cy4) * (px2 - cx4);
+      if ((d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0)) covered = true;
+    }
+    ok(covered, 'mesher: sqrt-domain fill reaches the domain edge');
+
+    // 6b. dashes are flagged open so flatRibbon never wraps them into loops
+    var dashes2 = MM.dashPolylines([[[0, 0, 0], [10, 0, 0]]], 1, 1);
+    ok(dashes2.every(function (dp) { return dp.open === true; }), 'mesher: dashes are marked open');
+
+    // pole guard end-to-end: 1/x - y must not mesh a wall across x = 0
+    var pole3 = MM.polygonize(function (x, y, z) { return 1 / x - y; }, win8, 16, { refine: true, gradF: true });
+    var longEdge = 0;
+    for (var pt2 = 0; pt2 < pole3.idx.length; pt2 += 3) {
+      for (var pe = 0; pe < 3; pe++) {
+        var va3 = pole3.idx[pt2 + pe] * 3, vb3 = pole3.idx[pt2 + (pe + 1) % 3] * 3;
+        var el2 = Math.hypot(pole3.pos[va3] - pole3.pos[vb3], pole3.pos[va3 + 1] - pole3.pos[vb3 + 1], pole3.pos[va3 + 2] - pole3.pos[vb3 + 2]);
+        if (el2 > 1.5) longEdge++;
+      }
+    }
+    ok(longEdge === 0, 'mesher: pole field grows no asymptote wall', longEdge + ' long edges');
+
+    // 5. NaN robustness: sqrt half-space; no NaN output, still meshes
+    var nanF = function (x, y, z) { return Math.sqrt(x) - 1; };
+    var nan3 = MM.polygonize(nanF, win8, 12, { refine: true, gradF: true });
+    var nanBad = false;
+    for (var nv = 0; nv < nan3.pos.length; nv++) if (!isFinite(nan3.pos[nv])) nanBad = true;
+    for (var nv2 = 0; nv2 < nan3.nrm.length; nv2++) if (!isFinite(nan3.nrm[nv2])) nanBad = true;
+    ok(!nanBad, 'mesher: NaN domains produce finite geometry only');
+
+    // 6. dashes: 10-long line, dash 1 / gap 1 → 5 dashes
+    var dashes = MM.dashPolylines([[[0, 0, 0], [10, 0, 0]]], 1, 1);
+    ok(dashes.length === 5, 'mesher: dash splitting', 'got ' + dashes.length);
+
+    // 7. perf smoke: settle-grade sphere well under interactive budgets
+    var t0p = Date.now();
+    MM.polygonize(sphF, win8, 48, { refine: true, gradF: true });
+    var dtp = Date.now() - t0p;
+    ok(dtp < 1500, 'mesher: N=48 refined sphere under 1.5s in gjs', dtp + 'ms');
+  } catch (e) { ok(false, 'mesher suite threw', e.message + ' | ' + (e.stack || '')); }
+
   print('PASS ' + passed + '  FAIL ' + failed);
   failures.forEach(function (f2) { print('  FAILED: ' + f2); });
   if (failed > 0) imports.system.exit(1);
