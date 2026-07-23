@@ -714,7 +714,7 @@
             break;
           case 'region3':
             row.showRegionBounds(row.state.regionBounds, function () {
-              self.recompute();
+              self.scheduleRecompute(); // live while typing, debounced
               self.saveSoon();
             });
             break;
@@ -780,10 +780,10 @@
           row._boundsKey = bKey;
           row._boundNodes = [];
           s.regionBounds.forEach(function (str) {
-            str = (str || '').trim();
-            if (!str) return;
-            try { row._boundNodes = row._boundNodes.concat(P.regionConstraints(P.parse(str))); }
-            catch (e) { /* invalid bound: buildObject reports it */ }
+            try {
+              var bc = P.parseBound(str);
+              if (bc) row._boundNodes = row._boundNodes.concat(bc);
+            } catch (e) { /* invalid bound: buildObject reports it */ }
           });
         }
         nodes = nodes.concat(row._boundNodes || []);
@@ -961,12 +961,10 @@
           // e.g. x²+y² < z < 4). All constraints intersect: F = max(gᵢ) ≤ 0.
           var nodes = [];
           (s.regionBounds || []).forEach(function (str, bi) {
-            str = (str || '').trim();
-            if (!str) return;
-            var bst, bc;
-            try { bst = P.parse(str); } catch (e) { throw new Error('bound ' + (bi + 1) + ': ' + e.message); }
-            try { bc = P.regionConstraints(bst); } catch (e2) { throw new Error('bound ' + (bi + 1) + ': ' + e2.message); }
-            nodes = nodes.concat(bc);
+            var bc;
+            try { bc = P.parseBound(str); }
+            catch (e) { throw new Error('bound ' + (bi + 1) + ': ' + e.message); }
+            if (bc) nodes = nodes.concat(bc);
           });
           if (!nodes.length) throw new Error('define at least one bound, e.g. -2 < x < 2');
           var RF = P.regionF(nodes);

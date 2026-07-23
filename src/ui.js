@@ -69,7 +69,7 @@
       domains: state.domains || {}, // {t0,t1,u0,u1,v0,v1} strings
       slider: state.slider || { min: '-10', max: '10', step: '' },
       isect: state.isect || null,  // {a: rowIndex, b: rowIndex} (persistence only)
-      regionBounds: state.regionBounds || ['', '', ''], // 3 inequality strings for a region object
+      regionBounds: state.regionBounds || [''], // inequality latex per bound (region object)
       flat2d: !!state.flat2d       // draw the flat trace instead of the extruded sheet
     };
     this._isectA = null; // live row references, resolved by the app
@@ -356,26 +356,68 @@
       mk('and', selB, 'b');
     },
 
-    /* -------- region bound fields (one inequality per axis) -------- */
+    /* -------- region bound fields --------
+     * Typed math like everywhere else in the app: each bound is a MathQuill
+     * field (so <= becomes ≤ while typing and Greek autocompletes), bounds
+     * can be added and removed freely, edits apply live, and a bound that
+     * does not parse is underlined without killing the others. */
     showRegionBounds: function (bounds, onChange) {
       var self = this;
       this.clearSub();
       var wrap = el('div', 'rgnstrip', this.substrip);
-      var holders = ['-2 < x < 2', '-2 < y < 2', 'x^2+y^2 < z < 4'];
-      bounds = bounds || ['', '', ''];
-      [0, 1, 2].forEach(function (i) {
-        var box = el('span', 'rgnb', wrap);
-        var inp = el('input', 'rgnin', box);
-        inp.value = bounds[i] || '';
-        inp.placeholder = holders[i];
-        inp.spellcheck = false;
-        inp.addEventListener('change', function () {
-          var arr = (self.state.regionBounds || ['', '', '']).slice();
-          arr[i] = inp.value;
-          self.state.regionBounds = arr;
-          onChange();
+      var list = el('div', 'rgnlist', wrap);
+      var foot = el('div', 'rgnfoot', wrap);
+      var add = el('button', 'rgnadd', foot);
+      add.textContent = '+ bound';
+      add.title = 'add another bound; all bounds combine by intersection';
+      var hint = el('span', 'rgnhint', foot);
+      hint.textContent = 'bounds intersect, e.g. -2 < x < 2 and x²+y² ≤ z';
+      var fields = [];
+      var squelch = false;
+      var sync = function () {
+        self.state.regionBounds = fields.map(function (f) { return f.mf.latex(); });
+        fields.forEach(function (f) {
+          var ok = true;
+          try { P.parseBound(f.mf.latex()); } catch (e) { ok = false; }
+          f.box.classList.toggle('rgnbad', !ok);
         });
-      });
+        onChange();
+      };
+      var addField = function (latex, focus) {
+        var box = el('span', 'rgnb', list);
+        var span = el('span', 'rgnmq', box);
+        var f = { box: box, mf: null };
+        f.mf = MQ.MathField(span, Object.assign({}, MQ_CONFIG_BASE, {
+          handlers: { edit: function () { if (!squelch) sync(); } }
+        }));
+        var rm = el('button', 'rgnrm', box);
+        rm.innerHTML = '&times;';
+        rm.title = 'remove this bound';
+        rm.addEventListener('click', function () {
+          if (fields.length <= 1) {
+            squelch = true; f.mf.latex(''); squelch = false;
+            sync();
+            return;
+          }
+          fields.splice(fields.indexOf(f), 1);
+          box.remove();
+          sync();
+        });
+        if (latex) {
+          squelch = true;
+          // legacy plain-text saves: show <= / >= as real ≤ / ≥
+          f.mf.latex(latex.replace(/<=/g, '\\le ').replace(/>=/g, '\\ge '));
+          squelch = false;
+        }
+        fields.push(f);
+        if (focus) f.mf.focus();
+        return f;
+      };
+      ((bounds && bounds.length ? bounds : ['']).filter(function (b, i, arr) {
+        // drop saved trailing blanks (the old UI always kept three fields)
+        return b || i === 0 || arr.slice(i).some(function (x) { return x; });
+      })).forEach(function (b) { addField(b || '', false); });
+      add.addEventListener('click', function () { addField('', true); });
     },
 
     getDomain: function (name, defLo, defHi) {

@@ -443,6 +443,20 @@
     var threwEq = false;
     try { P.regionConstraints(P.parse('x=2')); } catch (e2) { threwEq = true; }
     ok(threwEq, 'region: equality bound rejected');
+
+    // parseBound: MathQuill latex, plain-text <= / >=, unicode signs, chains
+    ok(P.parseBound('') === null && P.parseBound('   ') === null, 'parseBound: empty → null');
+    ok(P.parseBound('x\\le 2').length === 1, 'parseBound: \\le parses');
+    ok(P.parseBound('x<=2').length === 1, 'parseBound: plain <= parses');
+    ok(P.parseBound('-2<=x<=2').length === 2, 'parseBound: chained <= parses');
+    ok(P.parseBound('x≥1').length === 1, 'parseBound: unicode ≥ parses');
+    var pbF = P.makeFn(P.regionF(P.parseBound('x<=2').concat(P.parseBound('x>=-1'))),
+      ['x', 'y', 'z'], emptyEnv(), rsubst);
+    ok(pbF(0, 0, 0) <= 0 && pbF(3, 0, 0) > 0 && pbF(-2, 0, 0) > 0,
+      'parseBound: <= and >= orient the constraints correctly');
+    var pbThrew = false;
+    try { P.parseBound('x=2'); } catch (e3) { pbThrew = true; }
+    ok(pbThrew, 'parseBound: equality rejected');
   } catch (e) { ok(false, 'region suite threw', e.message + ' | ' + (e.stack || '')); }
 
   /* ---------- mesher: polygonizer, caps, 2D fill ---------- */

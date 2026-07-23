@@ -625,13 +625,29 @@ button { font-family: inherit; cursor: pointer; }
 .dom .dlab { color: var(--muted); font-style: italic; }
 
 .rgnstrip { display: flex; flex-direction: column; gap: 4px; padding: 4px 6px 5px; }
-.rgnb { display: flex; }
-.rgnin {
-  width: 100%; border: none; border-bottom: 1px dotted var(--muted);
-  font-size: 12.5px; color: var(--text-soft); background: none; outline: none;
-  font-family: inherit;
+.rgnlist { display: flex; flex-direction: column; gap: 4px; }
+.rgnb { display: flex; align-items: center; gap: 4px; }
+.rgnmq.mq-editable-field {
+  flex: 1; min-width: 120px; font-size: 13px;
+  border: none; border-bottom: 1px dotted var(--muted);
+  padding: 1px 2px; box-shadow: none; color: var(--text);
 }
-.rgnin::placeholder { color: var(--muted); font-style: italic; opacity: 0.7; }
+.rgnmq.mq-editable-field.mq-focused {
+  border-bottom: 1px solid var(--accent); box-shadow: none;
+}
+.rgnb.rgnbad .rgnmq.mq-editable-field { border-bottom: 1px solid #c74440; }
+.rgnrm {
+  border: none; background: none; color: var(--muted); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 3px; border-radius: 3px;
+}
+.rgnrm:hover { color: var(--text); background: var(--hair-3); }
+.rgnfoot { display: flex; align-items: baseline; gap: 10px; }
+.rgnadd {
+  border: 1px solid var(--chip-border); background: none; color: var(--text-soft);
+  font-size: 11.5px; padding: 1px 8px; border-radius: 10px; cursor: pointer;
+}
+.rgnadd:hover { background: var(--accent-bg); color: var(--accent); }
+.rgnhint { font-size: 11px; color: var(--muted); font-style: italic; }
 
 .addsliders { padding: 2px 6px 3px; color: var(--muted); }
 .addslider {
@@ -2754,6 +2770,16 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
   // combine constraints into one field F where F ≤ 0 ⇔ all constraints hold
   P.regionF = function (nodes) {
     return nodes.length === 1 ? nodes[0] : { t: 'call', name: 'max', args: nodes };
+  };
+  // one region-bound text → its constraint list (or null when empty). Bounds
+  // come from MathQuill as LaTeX, but legacy saves and hand-typed text may
+  // use plain <= / >= or the unicode signs — normalize before parsing.
+  P.parseBound = function (str) {
+    str = (str || '').trim();
+    if (!str) return null;
+    str = str.replace(/<=/g, '\\le ').replace(/>=/g, '\\ge ')
+             .replace(/≤/g, '\\le ').replace(/≥/g, '\\ge ');
+    return P.regionConstraints(P.parse(str));
   };
 
   P.classify = function (stmt, env) {
@@ -5462,7 +5488,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       domains: state.domains || {}, // {t0,t1,u0,u1,v0,v1} strings
       slider: state.slider || { min: '-10', max: '10', step: '' },
       isect: state.isect || null,  // {a: rowIndex, b: rowIndex} (persistence only)
-      regionBounds: state.regionBounds || ['', '', ''], // 3 inequality strings for a region object
+      regionBounds: state.regionBounds || [''], // inequality latex per bound (region object)
       flat2d: !!state.flat2d       // draw the flat trace instead of the extruded sheet
     };
     this._isectA = null; // live row references, resolved by the app
@@ -5749,26 +5775,68 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
       mk('and', selB, 'b');
     },
 
-    /* -------- region bound fields (one inequality per axis) -------- */
+    /* -------- region bound fields --------
+     * Typed math like everywhere else in the app: each bound is a MathQuill
+     * field (so <= becomes ≤ while typing and Greek autocompletes), bounds
+     * can be added and removed freely, edits apply live, and a bound that
+     * does not parse is underlined without killing the others. */
     showRegionBounds: function (bounds, onChange) {
       var self = this;
       this.clearSub();
       var wrap = el('div', 'rgnstrip', this.substrip);
-      var holders = ['-2 < x < 2', '-2 < y < 2', 'x^2+y^2 < z < 4'];
-      bounds = bounds || ['', '', ''];
-      [0, 1, 2].forEach(function (i) {
-        var box = el('span', 'rgnb', wrap);
-        var inp = el('input', 'rgnin', box);
-        inp.value = bounds[i] || '';
-        inp.placeholder = holders[i];
-        inp.spellcheck = false;
-        inp.addEventListener('change', function () {
-          var arr = (self.state.regionBounds || ['', '', '']).slice();
-          arr[i] = inp.value;
-          self.state.regionBounds = arr;
-          onChange();
+      var list = el('div', 'rgnlist', wrap);
+      var foot = el('div', 'rgnfoot', wrap);
+      var add = el('button', 'rgnadd', foot);
+      add.textContent = '+ bound';
+      add.title = 'add another bound; all bounds combine by intersection';
+      var hint = el('span', 'rgnhint', foot);
+      hint.textContent = 'bounds intersect, e.g. -2 < x < 2 and x²+y² ≤ z';
+      var fields = [];
+      var squelch = false;
+      var sync = function () {
+        self.state.regionBounds = fields.map(function (f) { return f.mf.latex(); });
+        fields.forEach(function (f) {
+          var ok = true;
+          try { P.parseBound(f.mf.latex()); } catch (e) { ok = false; }
+          f.box.classList.toggle('rgnbad', !ok);
         });
-      });
+        onChange();
+      };
+      var addField = function (latex, focus) {
+        var box = el('span', 'rgnb', list);
+        var span = el('span', 'rgnmq', box);
+        var f = { box: box, mf: null };
+        f.mf = MQ.MathField(span, Object.assign({}, MQ_CONFIG_BASE, {
+          handlers: { edit: function () { if (!squelch) sync(); } }
+        }));
+        var rm = el('button', 'rgnrm', box);
+        rm.innerHTML = '&times;';
+        rm.title = 'remove this bound';
+        rm.addEventListener('click', function () {
+          if (fields.length <= 1) {
+            squelch = true; f.mf.latex(''); squelch = false;
+            sync();
+            return;
+          }
+          fields.splice(fields.indexOf(f), 1);
+          box.remove();
+          sync();
+        });
+        if (latex) {
+          squelch = true;
+          // legacy plain-text saves: show <= / >= as real ≤ / ≥
+          f.mf.latex(latex.replace(/<=/g, '\\le ').replace(/>=/g, '\\ge '));
+          squelch = false;
+        }
+        fields.push(f);
+        if (focus) f.mf.focus();
+        return f;
+      };
+      ((bounds && bounds.length ? bounds : ['']).filter(function (b, i, arr) {
+        // drop saved trailing blanks (the old UI always kept three fields)
+        return b || i === 0 || arr.slice(i).some(function (x) { return x; });
+      })).forEach(function (b) { addField(b || '', false); });
+      add.addEventListener('click', function () { addField('', true); });
     },
 
     getDomain: function (name, defLo, defHi) {
@@ -6612,7 +6680,7 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
             break;
           case 'region3':
             row.showRegionBounds(row.state.regionBounds, function () {
-              self.recompute();
+              self.scheduleRecompute(); // live while typing, debounced
               self.saveSoon();
             });
             break;
@@ -6678,10 +6746,10 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           row._boundsKey = bKey;
           row._boundNodes = [];
           s.regionBounds.forEach(function (str) {
-            str = (str || '').trim();
-            if (!str) return;
-            try { row._boundNodes = row._boundNodes.concat(P.regionConstraints(P.parse(str))); }
-            catch (e) { /* invalid bound: buildObject reports it */ }
+            try {
+              var bc = P.parseBound(str);
+              if (bc) row._boundNodes = row._boundNodes.concat(bc);
+            } catch (e) { /* invalid bound: buildObject reports it */ }
           });
         }
         nodes = nodes.concat(row._boundNodes || []);
@@ -6859,12 +6927,10 @@ return 1===t.length?t:"{"+(t||" ")+"}"}return this.ctrlSeq+"_"+t(this.ends[Tt].l
           // e.g. x²+y² < z < 4). All constraints intersect: F = max(gᵢ) ≤ 0.
           var nodes = [];
           (s.regionBounds || []).forEach(function (str, bi) {
-            str = (str || '').trim();
-            if (!str) return;
-            var bst, bc;
-            try { bst = P.parse(str); } catch (e) { throw new Error('bound ' + (bi + 1) + ': ' + e.message); }
-            try { bc = P.regionConstraints(bst); } catch (e2) { throw new Error('bound ' + (bi + 1) + ': ' + e2.message); }
-            nodes = nodes.concat(bc);
+            var bc;
+            try { bc = P.parseBound(str); }
+            catch (e) { throw new Error('bound ' + (bi + 1) + ': ' + e.message); }
+            if (bc) nodes = nodes.concat(bc);
           });
           if (!nodes.length) throw new Error('define at least one bound, e.g. -2 < x < 2');
           var RF = P.regionF(nodes);

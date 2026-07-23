@@ -67,6 +67,16 @@
   P.regionF = function (nodes) {
     return nodes.length === 1 ? nodes[0] : { t: 'call', name: 'max', args: nodes };
   };
+  // one region-bound text → its constraint list (or null when empty). Bounds
+  // come from MathQuill as LaTeX, but legacy saves and hand-typed text may
+  // use plain <= / >= or the unicode signs — normalize before parsing.
+  P.parseBound = function (str) {
+    str = (str || '').trim();
+    if (!str) return null;
+    str = str.replace(/<=/g, '\\le ').replace(/>=/g, '\\ge ')
+             .replace(/≤/g, '\\le ').replace(/≥/g, '\\ge ');
+    return P.regionConstraints(P.parse(str));
+  };
 
   P.classify = function (stmt, env) {
     if (stmt.kind === 'empty') return { type: 'empty' };

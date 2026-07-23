@@ -175,13 +175,29 @@ button { font-family: inherit; cursor: pointer; }
 .dom .dlab { color: var(--muted); font-style: italic; }
 
 .rgnstrip { display: flex; flex-direction: column; gap: 4px; padding: 4px 6px 5px; }
-.rgnb { display: flex; }
-.rgnin {
-  width: 100%; border: none; border-bottom: 1px dotted var(--muted);
-  font-size: 12.5px; color: var(--text-soft); background: none; outline: none;
-  font-family: inherit;
+.rgnlist { display: flex; flex-direction: column; gap: 4px; }
+.rgnb { display: flex; align-items: center; gap: 4px; }
+.rgnmq.mq-editable-field {
+  flex: 1; min-width: 120px; font-size: 13px;
+  border: none; border-bottom: 1px dotted var(--muted);
+  padding: 1px 2px; box-shadow: none; color: var(--text);
 }
-.rgnin::placeholder { color: var(--muted); font-style: italic; opacity: 0.7; }
+.rgnmq.mq-editable-field.mq-focused {
+  border-bottom: 1px solid var(--accent); box-shadow: none;
+}
+.rgnb.rgnbad .rgnmq.mq-editable-field { border-bottom: 1px solid #c74440; }
+.rgnrm {
+  border: none; background: none; color: var(--muted); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 3px; border-radius: 3px;
+}
+.rgnrm:hover { color: var(--text); background: var(--hair-3); }
+.rgnfoot { display: flex; align-items: baseline; gap: 10px; }
+.rgnadd {
+  border: 1px solid var(--chip-border); background: none; color: var(--text-soft);
+  font-size: 11.5px; padding: 1px 8px; border-radius: 10px; cursor: pointer;
+}
+.rgnadd:hover { background: var(--accent-bg); color: var(--accent); }
+.rgnhint { font-size: 11px; color: var(--muted); font-style: italic; }
 
 .addsliders { padding: 2px 6px 3px; color: var(--muted); }
 .addslider {
